@@ -1,0 +1,37 @@
+# repos.conf — host-specific repository list
+#
+# One restic repository URL per line. Blank lines and comments (#) are ignored.
+# Copy to "repos.conf" and adjust.
+#
+# ANY backend supported by restic works. rclone is optional — only targets with
+# an "rclone:" prefix require rclone (and are checked for reachability
+# beforehand via "rclone lsd"). Other backends are used directly.
+#
+# IMPORTANT: Multiple hosts must write to SEPARATE repositories. restic repos
+# do not support simultaneous write access from multiple hosts.
+
+# Tip: one repository name per host (e.g. restic-<host>) so that multiple hosts
+# do not share the same repository.
+
+# --- Local / externally mounted (no rclone needed) ---
+/mnt/backup/restic-<host>
+# /srv/backup/restic-<host>
+
+# --- SFTP (no rclone needed) ---
+# sftp:user@backup-host:/srv/restic-<host>
+
+# --- S3 / compatible (no rclone needed; credentials via environment) ---
+# s3:s3.amazonaws.com/bucket-name/restic-<host>
+
+# --- Via rclone (rclone required, set up remote beforehand via "rclone config") ---
+#
+# CAUTION: The backup script runs as root, but "rclone config" is usually run as
+# a normal user. Then the rclone.conf is in that user's home
+# (~/.config/rclone/rclone.conf) and is NOT readable by root — the targets are
+# then treated as "not reachable" and skipped. Remedy:
+#   a) run "rclone config" as root straight away, OR
+#   b) set RCLONE_CONFIG_FILE in config.sh to the absolute path of the
+#      rclone.conf (e.g. /home/USER/.config/rclone/rclone.conf).
+# The script checks this at startup and writes a corresponding note to the log.
+# rclone:pcloud:restic-<host>
+# rclone:hetzner:restic-<host>

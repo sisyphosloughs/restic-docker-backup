@@ -1,0 +1,11 @@
+# Host-spezifische Konfiguration und Geheimnisse — nie committen
+config.sh
+repos.conf
+repo.password
+
+# Laufzeit-Logs
+logs/
+
+# Mutagen-Sync
+mutagen.yml.lock
+mutagen.yml

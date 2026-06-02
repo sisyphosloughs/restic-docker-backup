@@ -2,9 +2,14 @@
 #
 # restic-backup.sh — automated restic backups for Docker stacks
 #
-# A single script, with host-specific configuration in separate files
-# (config.sh, repos.conf, repo.password) in the same directory.
-# Must run with root privileges. See README.md.
+# A single script, with host-specific configuration in separate files:
+#   global.conf            global switches (binaries, repos, Telegram, …)
+#   instances/<name>.conf  one file per backed-up object (BACKUP_PATH, EXCLUDES,
+#                          DOCKER, STOP_STACKS)
+#   repos.conf             one restic repository URL per line
+#   repo.password          restic password (chmod 600, owned by root)
+# all in the same directory as this script. Must run with root privileges.
+# See README.md.
 
 set -uo pipefail
 
@@ -19,17 +24,23 @@ HOSTNAME_SHORT="$(hostname -s 2>/dev/null || hostname)"
 
 # Global error store
 ERRORS=()
-# Stacks stopped by the script (for restart / trap)
+# Stacks stopped by the script — FULL paths (for restart / trap)
 STOPPED_STACKS=()
 # Successfully backed-up targets
 SUCCESS_TARGETS=()
 # All reachable repos (for forget/prune/check)
 REACHABLE_REPOS=()
 
+# Aggregated from the instance configurations (see load_instances)
+BACKUP_PATHS=()        # all BACKUP_PATHs to back up (one snapshot per repo)
+EXCLUDE_PATTERNS=()    # anchored excludes collected from all instances
+STACK_DIRS=()          # full paths of stacks to stop/start/dump (DOCKER=true)
+ANY_DOCKER=0           # 1 if at least one instance has DOCKER=true
+
 # ---------------------------------------------------------------------------
 # Create the log directory and log file FIRST — so that configuration errors
 # also end up in a log file and do not just disappear on stderr.
-# Depends only on SCRIPT_DIR, not on config.sh.
+# Depends only on SCRIPT_DIR, not on the configuration.
 # ---------------------------------------------------------------------------
 
 LOG_DIR="$SCRIPT_DIR/logs"
@@ -70,25 +81,42 @@ fatal() {
 }
 
 # ---------------------------------------------------------------------------
-# Program/availability checks
+# Small helpers / availability checks
 # Defined early so they can run before the rest of the configuration is
 # validated (a missing restic should abort before anything else).
 # ---------------------------------------------------------------------------
 
-docker_stacks_enabled() {
-  # Whether the optional Docker stack orchestration (DB dumps + stop/start) is
-  # turned on. Controlled by DOCKER_STACKS_ENABLED in config.sh; default off.
-  case "${DOCKER_STACKS_ENABLED:-false}" in
+contains() {
+  # contains <needle> <haystack...> — returns 0 if <needle> is among the args.
+  local needle="$1"; shift
+  local x
+  for x in "$@"; do
+    [[ "$x" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+instance_docker_enabled() {
+  # Whether an instance's DOCKER flag is turned on. Accepts the usual truthy
+  # spellings; everything else (incl. unset/empty) is treated as off.
+  case "${1:-false}" in
     1|true|TRUE|True|yes|YES|Yes|on|ON) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+any_docker_enabled() {
+  # Whether the optional Docker stack orchestration (DB dumps + stop/start) runs
+  # at all — true as soon as at least one instance has DOCKER=true. Replaces the
+  # former global DOCKER_STACKS_ENABLED switch.
+  [[ "${ANY_DOCKER:-0}" -eq 1 ]]
 }
 
 dry_run_enabled() {
   # When enabled, restic runs the backup with --dry-run --verbose=2: nothing is
   # written, and the per-file listing of what *would* be backed up goes to the
   # log. The repository-modifying steps (forget/prune) and the monthly check
-  # are skipped. Controlled by DRY_RUN in config.sh; default off.
+  # are skipped. Controlled by DRY_RUN in global.conf; default off.
   case "${DRY_RUN:-false}" in
     1|true|TRUE|True|yes|YES|Yes|on|ON) return 0 ;;
     *) return 1 ;;
@@ -106,7 +134,7 @@ check_binaries() {
   # Check and log the availability of the required external programs at the very
   # start, so missing/mislocated binaries are obvious in the log instead of
   # surfacing as cryptic failures later. Honours the optional RESTIC_BIN /
-  # RCLONE_BIN paths from config.sh.
+  # RCLONE_BIN paths from global.conf.
   log_info "--- Checking programs ---"
   local p
 
@@ -114,11 +142,11 @@ check_binaries() {
   if p="$(command -v "$RESTIC_BIN" 2>/dev/null)"; then
     log_info "restic found: $p ($("$RESTIC_BIN" version 2>/dev/null | head -n1))"
   else
-    fatal "restic not found: '$RESTIC_BIN'. Set RESTIC_BIN in config.sh to the absolute path (e.g. /volume1/opt/bin/restic)."
+    fatal "restic not found: '$RESTIC_BIN'. Set RESTIC_BIN in global.conf to the absolute path (e.g. /volume1/opt/bin/restic)."
   fi
 
-  # docker + Compose V2 plugin — only relevant when stack management is enabled.
-  if docker_stacks_enabled; then
+  # docker + Compose V2 plugin — only relevant when an instance uses DOCKER.
+  if any_docker_enabled; then
     if p="$(command -v docker 2>/dev/null)"; then
       if docker compose version >/dev/null 2>&1; then
         log_info "docker found: $p (Compose V2 plugin available)"
@@ -129,7 +157,7 @@ check_binaries() {
       log_error "docker not found — stacks cannot be stopped/started"
     fi
   else
-    log_info "Docker stack management disabled (DOCKER_STACKS_ENABLED) — skipping docker/compose check"
+    log_info "No instance has DOCKER=true — skipping docker/compose check"
   fi
 
   # rclone (only if rclone targets are configured).
@@ -137,7 +165,7 @@ check_binaries() {
     if p="$(command -v "$RCLONE_BIN" 2>/dev/null)"; then
       log_info "rclone found: $p ($("$RCLONE_BIN" version 2>/dev/null | head -n1)); restic uses it via -o rclone.program"
     else
-      log_error "rclone targets configured, but rclone not found: '$RCLONE_BIN'. Set RCLONE_BIN in config.sh to the absolute path (e.g. /volume1/opt/bin/rclone)."
+      log_error "rclone targets configured, but rclone not found: '$RCLONE_BIN'. Set RCLONE_BIN in global.conf to the absolute path (e.g. /volume1/opt/bin/rclone)."
     fi
   fi
 
@@ -159,16 +187,124 @@ check_binaries() {
   fi
 }
 
+load_instances() {
+  # Collect all instance configurations from INSTANCES_DIR — one *.conf file per
+  # backed-up object. Each file may set:
+  #   BACKUP_PATH   (required) directory to back up
+  #   EXCLUDES      (array)    restic exclude patterns for this object
+  #   DOCKER        (bool)     run db-dump.sh + stop/start (BACKUP_PATH is then
+  #                            treated as a base dir whose sub-directories are
+  #                            stacks)
+  #   STOP_STACKS   (array)    sub-directory names to stop/start (empty = all);
+  #                            only relevant when DOCKER=true
+  #
+  # NOTE: the per-object path variable is BACKUP_PATH, NOT PATH — using the name
+  # "PATH" would clobber the shell's executable search path and break the run.
+  #
+  # Files are sourced one at a time with the four variables reset beforehand, so
+  # a value from one file never leaks into the next. Templates (*.example) are
+  # skipped (they do not end in .conf anyway).
+  #
+  # Aggregated into the globals used by the rest of the script:
+  #   BACKUP_PATHS[]     all valid BACKUP_PATHs (backed up together → one
+  #                      snapshot per repo)
+  #   EXCLUDE_PATTERNS[] union of all EXCLUDES, deduplicated (restic applies
+  #                      --exclude across every path of the single backup call)
+  #   STACK_DIRS[]       full paths of the stacks to stop/start/dump across all
+  #                      DOCKER=true instances
+  #   ANY_DOCKER         1 if at least one instance has DOCKER=true
+  local conf name pat base s d found=0
+
+  [[ -d "$INSTANCES_DIR" ]] || fatal "Instances directory not found: $INSTANCES_DIR"
+
+  for conf in "$INSTANCES_DIR"/*.conf; do
+    [[ -e "$conf" ]] || continue                 # no *.conf present at all
+    case "$conf" in *.example) continue ;; esac  # skip templates (defensive)
+
+    # Reset per-instance variables so nothing leaks between files.
+    local BACKUP_PATH="" DOCKER="false"
+    local EXCLUDES=() STOP_STACKS=()
+
+    # shellcheck source=/dev/null
+    source "$conf"
+    name="$(basename "${conf%.conf}")"
+    found=$((found + 1))
+
+    if [[ -z "$BACKUP_PATH" ]]; then
+      log_error "Instance '$name' ($conf): BACKUP_PATH not set — instance skipped"
+      continue
+    fi
+    if [[ ! -d "$BACKUP_PATH" ]]; then
+      log_error "Instance '$name': BACKUP_PATH does not exist, instance skipped: $BACKUP_PATH"
+      continue
+    fi
+
+    BACKUP_PATHS+=("$BACKUP_PATH")
+
+    # Anchor this instance's excludes to its BACKUP_PATH so they apply ONLY under
+    # that path. restic's --exclude is otherwise global across every path of the
+    # single backup call, so an unanchored basename pattern (e.g. @eaDir) would
+    # match under all instances. A pattern that already starts with "/" is taken
+    # verbatim (the user anchors it themselves — the escape hatch). A relative /
+    # basename pattern <pat> is emitted in two anchored forms so it matches at
+    # every depth under the base:
+    #   <base>/<pat>     directly in the base directory
+    #   <base>/**/<pat>  at any depth below it
+    # The explicit <base>/<pat> is a safety net in case restic's ** does not
+    # match zero directories. Patterns are deduplicated.
+    base="${BACKUP_PATH%/}"
+    for pat in "${EXCLUDES[@]+"${EXCLUDES[@]}"}"; do
+      [[ -z "$pat" ]] && continue
+      if [[ "$pat" == /* ]]; then
+        contains "$pat" "${EXCLUDE_PATTERNS[@]+"${EXCLUDE_PATTERNS[@]}"}" \
+          || EXCLUDE_PATTERNS+=("$pat")
+      else
+        contains "$base/$pat" "${EXCLUDE_PATTERNS[@]+"${EXCLUDE_PATTERNS[@]}"}" \
+          || EXCLUDE_PATTERNS+=("$base/$pat")
+        contains "$base/**/$pat" "${EXCLUDE_PATTERNS[@]+"${EXCLUDE_PATTERNS[@]}"}" \
+          || EXCLUDE_PATTERNS+=("$base/**/$pat")
+      fi
+    done
+
+    if instance_docker_enabled "$DOCKER"; then
+      ANY_DOCKER=1
+      if [[ "${#STOP_STACKS[@]}" -gt 0 ]]; then
+        log_info "Instance '$name' (DOCKER): base $BACKUP_PATH — stop/start only: ${STOP_STACKS[*]}"
+        for s in "${STOP_STACKS[@]}"; do
+          [[ -z "$s" ]] && continue
+          if [[ -d "$BACKUP_PATH/$s" ]]; then
+            STACK_DIRS+=("$BACKUP_PATH/$s")
+          else
+            log_error "Instance '$name': configured stack (STOP_STACKS) not found, skipped: $BACKUP_PATH/$s"
+          fi
+        done
+      else
+        log_info "Instance '$name' (DOCKER): base $BACKUP_PATH — STOP_STACKS empty, all sub-stacks stopped/started"
+        for d in "$BACKUP_PATH"/*/; do
+          [[ -d "$d" ]] && STACK_DIRS+=("${d%/}")
+        done
+      fi
+    else
+      log_info "Instance '$name': $BACKUP_PATH (DOCKER=false)"
+    fi
+  done
+
+  [[ "$found" -gt 0 ]] \
+    || fatal "No instance configurations (*.conf) found in $INSTANCES_DIR"
+  [[ "${#BACKUP_PATHS[@]}" -gt 0 ]] \
+    || fatal "No valid instances (with an existing BACKUP_PATH) in $INSTANCES_DIR"
+}
+
 # ---------------------------------------------------------------------------
 # Load configuration (logging is now available)
 # ---------------------------------------------------------------------------
 
-CONFIG_FILE="$SCRIPT_DIR/config.sh"
-if [[ ! -f "$CONFIG_FILE" ]]; then
-  fatal "Configuration file not found: $CONFIG_FILE"
+GLOBAL_CONF="$SCRIPT_DIR/global.conf"
+if [[ ! -f "$GLOBAL_CONF" ]]; then
+  fatal "Global configuration file not found: $GLOBAL_CONF"
 fi
 # shellcheck source=/dev/null
-source "$CONFIG_FILE"
+source "$GLOBAL_CONF"
 
 # Optional absolute paths to the restic / rclone binaries. Empty / unset = use
 # whatever is found in PATH. On some hosts (e.g. a NAS) the binaries live in a
@@ -180,40 +316,25 @@ source "$CONFIG_FILE"
 : "${RESTIC_BIN:=restic}"
 : "${RCLONE_BIN:=rclone}"
 
-# Optional Docker stack orchestration (DB dumps + stop/start of stacks).
-# Default OFF: the script then only backs up the configured paths without
-# touching any containers. Set DOCKER_STACKS_ENABLED=true in config.sh to enable
-# stopping/starting stacks for a consistent backup. Set before check_binaries so
-# the docker/compose check only runs when the feature is actually enabled.
-: "${DOCKER_STACKS_ENABLED:=false}"
-
-# Check that the required programs are available before validating the rest of
-# the configuration. A missing restic aborts here (honours RESTIC_BIN/RCLONE_BIN).
-check_binaries
-
-# Check mandatory variables
-[[ -n "${STACKS_BASE:-}" ]]          || fatal "STACKS_BASE not set (config.sh)"
-[[ -n "${REPOS_FILE:-}" ]]           || fatal "REPOS_FILE not set (config.sh)"
-[[ -n "${RESTIC_PASSWORD_FILE:-}" ]] || fatal "RESTIC_PASSWORD_FILE not set (config.sh)"
-# Optional variables: take the value from config.sh if set there, otherwise
+# Check mandatory global variables
+[[ -n "${REPOS_FILE:-}" ]]           || fatal "REPOS_FILE not set (global.conf)"
+[[ -n "${RESTIC_PASSWORD_FILE:-}" ]] || fatal "RESTIC_PASSWORD_FILE not set (global.conf)"
+# Optional variables: take the value from global.conf if set there, otherwise
 # fall back to the default. The ":=" only assigns when the variable is unset or
-# empty, so a value defined in config.sh always wins.
+# empty, so a value defined in global.conf always wins.
 : "${DOCKER_STOP_TIMEOUT:=20}"
 : "${LOG_RETENTION_DAYS:=64}"
 : "${DRY_RUN:=false}"
-# Initialise EXTRA_PATHS / EXTRA_EXCLUDES as empty arrays if not set in
-# config.sh. Do not use "${EXTRA_PATHS[@]:-}" — that produces an empty
-# element "".
-if [[ -z "${EXTRA_PATHS+x}" ]]; then
-  EXTRA_PATHS=()
-fi
-if [[ -z "${EXTRA_EXCLUDES+x}" ]]; then
-  EXTRA_EXCLUDES=()
-fi
-# Default STOP_STACKS likewise.
-if [[ -z "${STOP_STACKS+x}" ]]; then
-  STOP_STACKS=()
-fi
+
+# Collect all instance configurations (sets BACKUP_PATHS, EXCLUDE_PATTERNS,
+# STACK_DIRS and ANY_DOCKER). Done before check_binaries so the docker/compose
+# check only runs when at least one instance actually uses DOCKER.
+INSTANCES_DIR="$SCRIPT_DIR/instances"
+load_instances
+
+# Check that the required programs are available (honours RESTIC_BIN/RCLONE_BIN
+# and ANY_DOCKER). A missing restic aborts here.
+check_binaries
 
 # Optional rclone configuration path. rclone does NOT reliably pick up the
 # config from the RCLONE_CONFIG environment variable on every host (on this NAS
@@ -357,7 +478,7 @@ check_rclone_config() {
   if [[ -n "$conf_path" && -r "$conf_path" ]]; then
     log_info "rclone configuration readable for user '$(id -un)': $conf_path"
   else
-    log_error "rclone configuration NOT readable for user '$(id -un)' (${conf_path:-no path determinable}). 'rclone config' was probably run as a different user — as root the rclone.conf is then not visible. Set RCLONE_CONFIG_FILE in config.sh to the absolute path of the rclone.conf (e.g. /home/USER/.config/rclone/rclone.conf) or run 'rclone config' as root. Otherwise all rclone targets are skipped as 'not reachable'."
+    log_error "rclone configuration NOT readable for user '$(id -un)' (${conf_path:-no path determinable}). 'rclone config' was probably run as a different user — as root the rclone.conf is then not visible. Set RCLONE_CONFIG_FILE in global.conf to the absolute path of the rclone.conf (e.g. /home/USER/.config/rclone/rclone.conf) or run 'rclone config' as root. Otherwise all rclone targets are skipped as 'not reachable'."
   fi
 }
 
@@ -409,10 +530,11 @@ cleanup() {
 
   log_error "Unexpected abort (exit code $rc) — bringing stopped stacks back up"
 
-  local stack
-  for stack in "${STOPPED_STACKS[@]:-}"; do
-    [[ -z "$stack" ]] && continue
-    if (cd "$STACKS_BASE/$stack" && docker compose start) >>"$LOG_FILE" 2>&1; then
+  local stack_dir stack
+  for stack_dir in "${STOPPED_STACKS[@]:-}"; do
+    [[ -z "$stack_dir" ]] && continue
+    stack="$(basename "$stack_dir")"
+    if (cd "$stack_dir" && docker compose start) >>"$LOG_FILE" 2>&1; then
       log_info "$stack: stack restarted after abort"
     else
       log "ERROR" "$stack: stack could NOT be started after abort (manual intervention needed)"
@@ -449,37 +571,20 @@ for repo in "${REPOS[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# 2.–3. Docker stack management (optional — DOCKER_STACKS_ENABLED)
-# Determine the stop/start selection (STACK_DIRS), run the DB dumps and stop the
-# stacks. This affects ONLY stop/start/dumps — regardless of this, the whole of
-# STACKS_BASE is always backed up (see backup step), including stacks that are
-# already stopped/inactive.
-#   STOP_STACKS populated → only these stacks; all others are left untouched.
-#   STOP_STACKS empty     → all stacks under STACKS_BASE.
-# When DOCKER_STACKS_ENABLED is off (default), this whole part is skipped and the
+# 2.–3. Docker stack management (optional — runs only if at least one instance
+# has DOCKER=true). STACK_DIRS was assembled while loading the instances: for
+# every DOCKER=true instance it holds the stack directories to stop/start (its
+# STOP_STACKS selection, or all sub-directories of its BACKUP_PATH when empty).
+# This affects ONLY stop/start/dumps — regardless of it, every instance's
+# BACKUP_PATH is always backed up in full (see backup step), including stacks
+# that are already stopped/inactive.
+# When no instance uses DOCKER (default), this whole part is skipped and the
 # data is backed up while the containers keep running.
 # ---------------------------------------------------------------------------
 
-STACK_DIRS=()
-if ! docker_stacks_enabled; then
-  log_info "Docker stack management disabled (DOCKER_STACKS_ENABLED) — no DB dumps, no stop/start; data is backed up while containers keep running"
+if ! any_docker_enabled; then
+  log_info "No instance has DOCKER=true — no DB dumps, no stop/start; data is backed up while containers keep running"
 else
-  if [[ "${#STOP_STACKS[@]}" -gt 0 ]]; then
-    log_info "Stop/start only for: ${STOP_STACKS[*]}"
-    for s in "${STOP_STACKS[@]}"; do
-      if [[ -d "$STACKS_BASE/$s" ]]; then
-        STACK_DIRS+=("$STACKS_BASE/$s")
-      else
-        log_error "Configured stack (STOP_STACKS) not found, skipped: $STACKS_BASE/$s"
-      fi
-    done
-  else
-    log_info "STOP_STACKS empty — all stacks under $STACKS_BASE are stopped/started"
-    for d in "$STACKS_BASE"/*/; do
-      [[ -d "$d" ]] && STACK_DIRS+=("$d")
-    done
-  fi
-
   # DB dumps
   log_info "--- DB dumps ---"
   for stack_dir in "${STACK_DIRS[@]+"${STACK_DIRS[@]}"}"; do
@@ -504,7 +609,7 @@ else
     [[ -f "$stack_dir/docker-compose.yml" || -f "$stack_dir/compose.yml" ]] || continue
 
     if (cd "$stack_dir" && docker compose stop --timeout "$DOCKER_STOP_TIMEOUT") >>"$LOG_FILE" 2>&1; then
-      STOPPED_STACKS+=("$stack")
+      STOPPED_STACKS+=("$stack_dir")
       log_info "$stack: stack stopped"
     else
       log_error "$stack: stack could not be stopped, will not be backed up"
@@ -523,22 +628,14 @@ fi
 have_jq=0
 command -v jq >/dev/null 2>&1 && have_jq=1
 
-# Build the list of paths to back up plus the restic exclude arguments.
-# STACKS_BASE plus every EXTRA_PATHS entry is backed up. EXTRA_EXCLUDES holds
-# restic exclude patterns and is passed verbatim — a pattern without a leading
-# "/" matches its basename at any depth, a pattern with a leading "/" is
-# anchored to that absolute path. Excludes apply across all backup paths.
-BACKUP_PATHS=("$STACKS_BASE")
-for entry in "${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}"; do
-  [[ -z "$entry" ]] && continue
-  BACKUP_PATHS+=("$entry")
-done
+# Build the restic exclude arguments from EXCLUDE_PATTERNS. All BACKUP_PATHs are
+# backed up together in one call per repo (one snapshot per repo). Relative
+# patterns have already been anchored to their instance's BACKUP_PATH by
+# load_instances, so each exclude applies only under its own path. Patterns with
+# a leading "/" were taken verbatim (user-anchored).
 EXCLUDE_ARGS=()
-EXCLUDE_PATTERNS=()
-for pat in "${EXTRA_EXCLUDES[@]+"${EXTRA_EXCLUDES[@]}"}"; do
-  [[ -z "$pat" ]] && continue
+for pat in "${EXCLUDE_PATTERNS[@]+"${EXCLUDE_PATTERNS[@]}"}"; do
   EXCLUDE_ARGS+=(--exclude "$pat")
-  EXCLUDE_PATTERNS+=("$pat")
 done
 log_info "Backup paths: ${BACKUP_PATHS[*]}"
 if [[ "${#EXCLUDE_PATTERNS[@]}" -gt 0 ]]; then
@@ -621,14 +718,15 @@ for repo in "${REPOS[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# 5. Start stacks (only if stack management is enabled)
+# 5. Start stacks (only if at least one instance uses DOCKER)
 # ---------------------------------------------------------------------------
 
-if docker_stacks_enabled; then
+if any_docker_enabled; then
   log_info "--- Starting stacks ---"
-  for stack in "${STOPPED_STACKS[@]:-}"; do
-    [[ -z "$stack" ]] && continue
-    if (cd "$STACKS_BASE/$stack" && docker compose start) >>"$LOG_FILE" 2>&1; then
+  for stack_dir in "${STOPPED_STACKS[@]:-}"; do
+    [[ -z "$stack_dir" ]] && continue
+    stack="$(basename "$stack_dir")"
+    if (cd "$stack_dir" && docker compose start) >>"$LOG_FILE" 2>&1; then
       log_info "$stack: stack started (wait for health check)"
     else
       log_error "$stack: stack could not be started (manual intervention needed)"

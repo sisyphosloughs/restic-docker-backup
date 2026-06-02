@@ -6,44 +6,89 @@ in the same directory. Any backend supported by restic can serve as the backup
 target (local, SFTP, S3, REST, …); rclone is optional and only needed for
 `rclone:` targets.
 
-The optional Docker stack orchestration (DB dumps + stopping/starting stacks for
-a consistent backup) is **off by default** — out of the box the script just
-backs up the configured paths. Enable it with `DOCKER_STACKS_ENABLED=true`; see
-[Docker stack management](#docker-stack-management-docker_stacks_enabled).
+What gets backed up is described **per object** in `instances/<name>.conf` —
+one file per directory you want to back up. Each instance can optionally enable
+Docker stack orchestration (DB dumps + stopping/starting stacks for a consistent
+backup); this is **off by default** per instance. The global switches (binaries,
+repository list, Telegram, …) live in `global.conf`.
 
 ## Files
 
 ```
 <location>/
-├── restic-backup.sh        # the script (identical on all hosts)
-├── config.sh               # host-specific configuration  (from config.sh.example)
-├── repos.conf              # host-specific repository list (from repos.conf.example)
-├── repo.password           # restic password (chmod 600, owned by root)
-├── examples/               # example DB dump scripts
-└── logs/                   # one log file per run (auto-rotated), created by the script
+├── restic-backup.sh             # the script (identical on all hosts)
+├── global.conf                  # host-specific global config (from global.conf.example)
+├── instances/                   # one *.conf per backed-up object
+│   ├── instances.conf.example   # template for an instance
+│   └── <name>.conf              # e.g. containers.conf, audiobooks.conf
+├── repos.conf                   # host-specific repository list (from repos.conf.example)
+├── repo.password                # restic password (chmod 600, owned by root)
+├── examples/                    # example DB dump scripts
+└── logs/                        # one log file per run (auto-rotated), created by the script
 ```
 
 The script determines its own location at runtime; all paths are derived from
 `SCRIPT_DIR`. The location is freely choosable.
 
+## Configuration model
+
+Configuration is split in two:
+
+- **`global.conf`** — switches that apply to the whole run: `DRY_RUN`,
+  `REPOS_FILE`, `RESTIC_BIN` / `RCLONE_BIN`, `RCLONE_CONFIG_FILE`,
+  `RESTIC_PASSWORD_FILE`, the Telegram credentials, `DOCKER_STOP_TIMEOUT` and
+  `LOG_RETENTION_DAYS`.
+- **`instances/<name>.conf`** — one file per object (directory) to back up. The
+  script collects every `*.conf` in `instances/`. The file name (without
+  `.conf`) is the instance name shown in the log. Each file may set:
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `BACKUP_PATH` | — (required) | Directory to back up. For a Docker object this is the **base** directory whose sub-directories are the stacks. |
+  | `EXCLUDES` | empty | restic exclude patterns anchored to this instance's `BACKUP_PATH` (see below). |
+  | `DOCKER` | `false` | `true` → run `db-dump.sh` + stop/start the stacks under `BACKUP_PATH` for a consistent backup. |
+  | `STOP_STACKS` | empty | Which sub-stacks to stop/start (empty = all); only relevant when `DOCKER=true`. |
+
+> **Why `BACKUP_PATH` and not `PATH`?** `PATH` is the shell's executable search
+> path — a config file that set `PATH=…` would break command lookup for the rest
+> of the run. The per-object variable is therefore `BACKUP_PATH`.
+
+**How the instances are combined:** all `BACKUP_PATH`s across all instances are
+backed up **together in one `restic backup` call per repository** — one snapshot
+per repo. Each instance's `EXCLUDES` are **anchored to its own `BACKUP_PATH`**
+by the script, so a pattern only affects the path it was defined for (see
+[Backup paths and excludes](#backup-paths-and-excludes-backup_path--excludes)).
+The Docker orchestration runs as soon as **at least one** instance has
+`DOCKER=true`.
+
 ## Setup
 
 1. **Clone the repository / place the files** anywhere you like.
 
-2. **Create the configuration** (host-specific):
+2. **Create the global configuration** (host-specific):
    ```bash
-   cp config.sh.example config.sh
+   cp global.conf.example global.conf
    cp repos.conf.example repos.conf
-   $EDITOR config.sh repos.conf
+   $EDITOR global.conf repos.conf
    ```
-3. **Store the restic password**:
+
+3. **Create one instance per object to back up:**
+   ```bash
+   cp instances/instances.conf.example instances/audiobooks.conf
+   cp instances/instances.conf.example instances/containers.conf
+   $EDITOR instances/audiobooks.conf instances/containers.conf
+   ```
+   Set `BACKUP_PATH` in each, plus `EXCLUDES` / `DOCKER` / `STOP_STACKS` as
+   needed. At least one valid instance is required, or the run aborts.
+
+4. **Store the restic password**:
    ```bash
    sudo sh -c 'echo "YOUR-RESTIC-PASSWORD" > repo.password'
    sudo chown root:root repo.password
    sudo chmod 600 repo.password
    ```
 
-4. **Configure rclone** (only if `rclone:` targets are used):
+5. **Configure rclone** (only if `rclone:` targets are used):
    ```bash
    rclone config        # create remotes, e.g. pcloud, s3, b2
    ```
@@ -54,11 +99,11 @@ The script determines its own location at runtime; all paths are derived from
    > (`~/.config/rclone/rclone.conf`) and is **not readable** by root — all
    > `rclone:` targets are then treated as "not reachable" and skipped.
    > Remedy: either run `rclone config` as root straight away
-   > (`sudo rclone config`), **or** set `RCLONE_CONFIG_FILE` in `config.sh` to
+   > (`sudo rclone config`), **or** set `RCLONE_CONFIG_FILE` in `global.conf` to
    > the absolute path of the `rclone.conf`. The script checks this at startup
    > and writes a corresponding note to the log.
 
-5. **Initialise the repositories** (manually, once per target):
+6. **Initialise the repositories** (manually, once per target):
    ```bash
    # local target
    restic --repo /mnt/backup/restic-<host> \
@@ -73,7 +118,7 @@ The script determines its own location at runtime; all paths are derived from
    > the `rclone.conf` is not at root's default location, `restic init` must be
    > told the same way the script tells it (otherwise you get
    > `Config file ... not found` or `directory not found`). Mirror `RCLONE_BIN`
-   > and `RCLONE_CONFIG_FILE` from `config.sh`:
+   > and `RCLONE_CONFIG_FILE` from `global.conf`:
    > ```bash
    > restic \
    >   -o rclone.program=/volume1/opt/bin/rclone \
@@ -82,51 +127,57 @@ The script determines its own location at runtime; all paths are derived from
    >   --password-file ./repo.password init
    > ```
 
-6. **Set up DB dumps** (optional, per stack; requires
-   `DOCKER_STACKS_ENABLED=true`):
+7. **Set up DB dumps** (optional, per stack; requires a Docker instance with
+   `DOCKER=true`):
    Place an executable `db-dump.sh` in each stack directory. Templates are in
    [examples/](examples/). `STACK_NAME` is set by the backup script as an
    environment variable. The dump must be written to the bind mount `db-dumps/`
    (`/tmp/dumps` inside the container) so that it is backed up as well.
 
-## Docker stack management (`DOCKER_STACKS_ENABLED`)
+## Docker stack management (`DOCKER`)
 
 Stopping/starting Docker stacks (and running their `db-dump.sh` scripts) for a
-consistent backup is **optional and off by default**:
+consistent backup is **optional and off by default**, decided per instance:
 
 ```bash
-# config.sh
-DOCKER_STACKS_ENABLED=false   # default — back up paths, never touch containers
-# DOCKER_STACKS_ENABLED=true  # run DB dumps + stop/start stacks for the backup
+# instances/containers.conf
+BACKUP_PATH="/opt/containers"
+DOCKER=false   # default — back up the path, never touch containers
+# DOCKER=true  # run DB dumps + stop/start stacks for the backup
 ```
 
-- **`false` (default)** → the script backs up `STACKS_BASE` (and `EXTRA_PATHS`)
-  while the containers keep running. This is a *crash-consistent* backup — fine
-  for most file data, but databases with open files may not be captured in a
-  clean state. `docker` is **not required** in this mode and is not checked at
-  startup.
-- **`true`** → before the backup the script runs each stack's `db-dump.sh`, then
-  `docker compose stop`, and afterwards `docker compose start`. Which stacks are
-  affected is controlled by `STOP_STACKS` (below). In this mode `docker` plus the
-  Compose V2 plugin are required (and checked at startup).
+- **`DOCKER=false` (default)** → the instance's `BACKUP_PATH` is backed up while
+  the containers keep running. This is a *crash-consistent* backup — fine for
+  most file data, but databases with open files may not be captured in a clean
+  state.
+- **`DOCKER=true`** → `BACKUP_PATH` is treated as a **base directory** whose
+  sub-directories are Docker stacks. Before the backup the script runs each
+  selected stack's `db-dump.sh`, then `docker compose stop`, and afterwards
+  `docker compose start`. Which stacks are affected is controlled by
+  `STOP_STACKS` (below).
+
+`docker` plus the Compose V2 plugin are required (and checked at startup) **as
+soon as any instance has `DOCKER=true`** — never otherwise. Multiple Docker
+instances are allowed; their stacks are all handled in the one stop/start cycle.
 
 ## Which stacks are stopped? (`STOP_STACKS`)
 
-> Only relevant when `DOCKER_STACKS_ENABLED=true`.
+> Only relevant for an instance with `DOCKER=true`.
 
-**The whole of `STACKS_BASE` is always backed up** — including stacks that are
-already stopped or permanently inactive. The `STOP_STACKS` array solely controls
-which stacks are **stopped and then started again** for a consistent backup
-(and for which `db-dump.sh` runs):
+**The whole of a Docker instance's `BACKUP_PATH` is always backed up** —
+including stacks that are already stopped or permanently inactive. The
+`STOP_STACKS` array solely controls which sub-stacks are **stopped and then
+started again** for a consistent backup (and for which `db-dump.sh` runs):
 
-- **`STOP_STACKS` empty** → all stacks under `STACKS_BASE` are stopped and
+- **`STOP_STACKS` empty** → all stacks under `BACKUP_PATH` are stopped and
   started again.
-- **`STOP_STACKS` populated** (directory names under `STACKS_BASE`) → only these
-  stacks are stopped/started. All others are left untouched — they are neither
-  stopped nor (re)started, but are still backed up.
+- **`STOP_STACKS` populated** (sub-directory names under `BACKUP_PATH`) → only
+  these stacks are stopped/started. All others are left untouched — they are
+  neither stopped nor (re)started, but are still backed up.
 
 ```bash
-# config.sh — stop/start only these running stacks for the backup
+# instances/containers.conf — stop/start only these running stacks for the backup
+DOCKER=true
 STOP_STACKS=(
   "solidtime"
   "nextcloud"
@@ -140,46 +191,46 @@ that they are not started by mistake — they are backed up regardless.
 A listed but non-existent stack is logged as an error and skipped (the run does
 not abort).
 
-## Extra paths and excludes (`EXTRA_PATHS` / `EXTRA_EXCLUDES`)
+## Backup paths and excludes (`BACKUP_PATH` / `EXCLUDES`)
 
-`STACKS_BASE` is always backed up. `EXTRA_PATHS` adds further paths outside it
-(e.g. data shares on a NAS). `EXTRA_EXCLUDES` holds exclude patterns that are
-passed verbatim to restic's `--exclude` and apply across **all** backup paths
-(including `STACKS_BASE`):
+Each instance contributes its `BACKUP_PATH`; all of them are backed up together
+(one snapshot per repo). `EXCLUDES` holds exclude patterns that apply **only
+under this instance's `BACKUP_PATH`** — patterns from different instances do not
+interfere with each other.
 
 ```bash
-# config.sh
-EXTRA_PATHS=(
-  "/srv/photos"
-  "/srv/documents"
-)
-
-EXTRA_EXCLUDES=(
-  "@eaDir"                   # every "@eaDir" folder (Synology), at any depth
-  "*.tmp"                    # all *.tmp files anywhere
-  "/srv/documents/**/cache"  # cache dirs only under /srv/documents
+# instances/documents.conf
+BACKUP_PATH="/srv/documents"
+EXCLUDES=(
+  "@eaDir"          # only excludes "@eaDir" under /srv/documents
+  "*.tmp"           # only excludes *.tmp under /srv/documents
+  "/srv/data/cache" # leading "/" → verbatim; anchored to /srv/data/cache
 )
 ```
 
-Pattern anchoring follows restic's own rules (glob, `**` for any depth):
+**How anchoring works:** restic's `--exclude` is global per backup call, so the
+script automatically prepends each relative pattern with the instance's
+`BACKUP_PATH` before passing it to restic. A relative pattern `<pat>` from an
+instance with `BACKUP_PATH=/srv/documents` becomes two anchored forms:
 
-- A pattern **without** a leading `/` matches its basename at any depth — e.g.
-  `@eaDir` excludes every `@eaDir` folder under any backup path.
-- A pattern **with** a leading `/` is anchored to that absolute path — e.g.
-  `/srv/documents/**/cache` only touches `cache` dirs under `/srv/documents`.
+- `/srv/documents/<pat>` — matches directly in the base directory
+- `/srv/documents/**/<pat>` — matches at any depth below it
 
-The resolved backup paths and active excludes are written to the log at the
-start of the backup step.
+A pattern that **already starts with `/`** is used verbatim — the escape hatch
+for patterns that span multiple paths or that you want to anchor yourself.
+
+The resolved backup paths and active (anchored) excludes are written to the log
+at the start of the backup step.
 
 ## Program paths (`RESTIC_BIN` / `RCLONE_BIN`)
 
 By default the script calls `restic` and `rclone` as found in `PATH`. On some
 hosts — e.g. a NAS — the binaries live in a non-standard location that is not in
 the (cron) `PATH`, for instance `/volume1/opt/bin`. In that case set the
-absolute paths in `config.sh`:
+absolute paths in `global.conf`:
 
 ```bash
-# config.sh
+# global.conf
 RESTIC_BIN="/volume1/opt/bin/restic"
 RCLONE_BIN="/volume1/opt/bin/rclone"
 ```
@@ -193,7 +244,7 @@ Leave the variables empty (the default) to use whatever is found in `PATH`.
 
 At startup the script checks and logs the availability of all required programs:
 `restic` (always), and — depending on the configuration — `docker` incl. the
-Compose V2 plugin (only if `DOCKER_STACKS_ENABLED=true`), `rclone` (only if
+Compose V2 plugin (only if any instance has `DOCKER=true`), `rclone` (only if
 `rclone:` targets exist), `curl` (only if Telegram is configured) and `jq`. A
 missing `restic` aborts the run; the other tools are logged as errors/notes.
 This makes a mislocated binary obvious in the log instead of surfacing as a
@@ -212,15 +263,15 @@ Exit code: `0` on success, `1` on one or more errors.
 
 ## Dry run (`DRY_RUN`)
 
-Set `DRY_RUN=true` in `config.sh` to do a trial run without writing anything.
+Set `DRY_RUN=true` in `global.conf` to do a trial run without writing anything.
 restic then runs the backup with `--dry-run --verbose=2`, so a per-file listing
 of what *would* be backed up (including which files your excludes skip) is
 written to the log. No snapshot is created, and the repository-modifying
 steps — `forget`/`prune` and the monthly `check` — are skipped. Handy for
-verifying `EXTRA_PATHS` / `EXTRA_EXCLUDES` before a real run:
+verifying `BACKUP_PATH` / `EXCLUDES` before a real run:
 
 ```bash
-# config.sh
+# global.conf
 DRY_RUN=true
 ```
 
@@ -229,17 +280,18 @@ The log and the Telegram message are marked with `[DRY RUN]`. Set it back to
 
 ## Workflow
 
-1. Initialisation, open log file, check program availability, delete old logs,
-   unlock repos
-2. Run DB dumps per stack — *only if `DOCKER_STACKS_ENABLED=true`*
-3. Stop stacks (`docker compose stop`) — *only if `DOCKER_STACKS_ENABLED=true`*
-4. Back up `STACKS_BASE` + `EXTRA_PATHS` (with excludes) to each reachable target
-5. Start stacks again (`docker compose start`) — *only if `DOCKER_STACKS_ENABLED=true`*
+1. Initialisation, open log file, load `global.conf`, collect `instances/*.conf`,
+   check program availability, delete old logs, unlock repos
+2. Run DB dumps per stack — *only if at least one instance has `DOCKER=true`*
+3. Stop stacks (`docker compose stop`) — *only if `DOCKER=true` instances exist*
+4. Back up all instance `BACKUP_PATH`s (with merged excludes) to each reachable
+   target — one snapshot per repo
+5. Start stacks again (`docker compose start`) — *only if `DOCKER=true` instances exist*
 6. `restic forget --prune` (keep-daily 31, keep-monthly 99)
 7. `restic check` — monthly only (on the 1st)
 8. Summary to the log + Telegram notification
 
-With `DOCKER_STACKS_ENABLED=false` (default), steps 2/3/5 are skipped entirely
+When no instance has `DOCKER=true` (default), steps 2/3/5 are skipped entirely
 and the data is backed up while the containers keep running.
 
 With `DRY_RUN=true`, step 4 runs as `restic backup --dry-run --verbose=2`
@@ -288,7 +340,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 Alternatively (or for binaries in non-standard locations such as a NAS's
 `/volume1/opt/bin`), set `RESTIC_BIN` / `RCLONE_BIN` to absolute paths in
-`config.sh` — see [Program paths](#program-paths-restic_bin--rclone_bin). The
+`global.conf` — see [Program paths](#program-paths-restic_bin--rclone_bin). The
 startup program check then confirms in the log that the binaries were found.
 
 The script writes its own log file to `logs/` per run and reports the result via
@@ -325,7 +377,7 @@ The following must be available on the host:
 | Tool | Purpose | Note |
 |---|---|---|
 | `bash` | script interpreter | works even with old Bash 3.2 |
-| `docker` incl. **Compose V2 plugin** | stop/start stacks | **only required when `DOCKER_STACKS_ENABLED=true`** (and only then checked at startup). The script uses the plugin syntax **`docker compose`** (with a space), **not** the old `docker-compose` (with a hyphen) |
+| `docker` incl. **Compose V2 plugin** | stop/start stacks | **only required when an instance has `DOCKER=true`** (and only then checked at startup). The script uses the plugin syntax **`docker compose`** (with a space), **not** the old `docker-compose` (with a hyphen) |
 | `restic` | backup, forget/prune, check | found in `PATH`, or set `RESTIC_BIN` to an absolute path |
 | `rclone` | only for `rclone:` targets | **optional** — not needed for local/SFTP/S3/REST targets; set up remotes beforehand via `rclone config`. Found in `PATH`, or set `RCLONE_BIN` to an absolute path (no `PATH` entry needed then) |
 | `curl` | Telegram notification | only needed if Telegram is configured |

@@ -30,7 +30,7 @@
 # (~/.config/rclone/rclone.conf) and is NOT readable by root — the targets are
 # then treated as "not reachable" and skipped. Remedy:
 #   a) run "rclone config" as root straight away, OR
-#   b) set RCLONE_CONFIG_FILE in config.sh to the absolute path of the
+#   b) set RCLONE_CONFIG_FILE in global.conf to the absolute path of the
 #      rclone.conf (e.g. /home/USER/.config/rclone/rclone.conf).
 # The script checks this at startup and writes a corresponding note to the log.
 # rclone:pcloud:restic-<host>

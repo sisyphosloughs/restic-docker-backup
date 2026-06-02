@@ -1,0 +1,68 @@
+# instances/<name>.conf — one backed-up object per file
+#
+# Copy this template to instances/<name>.conf (e.g. instances/audiobooks.conf,
+# instances/containers.conf) and adjust. The file name (without ".conf") is the
+# instance name shown in the log. restic-backup.sh collects every "*.conf" file
+# in this directory; this ".example" file is ignored.
+#
+# Each file is sourced on its own with the four variables below reset
+# beforehand, so values never leak between instances. Leave a variable out to
+# get its default.
+#
+# All BACKUP_PATHs across all instances are backed up together — one restic
+# snapshot per repository. EXCLUDES from this file apply ONLY under this
+# instance's BACKUP_PATH: the script anchors every relative pattern to
+# BACKUP_PATH automatically, so "@eaDir" here only matches under THIS path and
+# not under any other instance's path. A pattern with a leading "/" is used
+# verbatim (you anchor it yourself — useful for cross-path or absolute excludes).
+
+# Directory to back up (REQUIRED).
+#
+# IMPORTANT: the variable is BACKUP_PATH, NOT "PATH" — "PATH" is the shell's
+# executable search path and using that name would break the run.
+#
+# For a plain data object this is just the directory (e.g. a NAS share).
+# For a Docker object (DOCKER=true) this is the BASE directory whose
+# sub-directories are the individual stacks (like the former STACKS_BASE).
+BACKUP_PATH="/srv/data"
+# BACKUP_PATH="/opt/containers"
+
+# Exclude patterns (optional). Uses restic's exclude syntax (glob, ** for any
+# depth). Relative patterns (no leading "/") are automatically anchored to this
+# instance's BACKUP_PATH — they apply ONLY under that path. A pattern WITH a
+# leading "/" is used verbatim (you anchor it yourself). Leave empty if not needed.
+#   "@eaDir"                  -> only excludes "@eaDir" under THIS BACKUP_PATH
+#   "*.tmp"                   -> only excludes *.tmp under THIS BACKUP_PATH
+#   "/srv/documents/**/cache" -> verbatim; anchored to /srv/documents regardless
+#                                of which instance uses it
+EXCLUDES=(
+  # "@eaDir"
+  # "#recycle"
+  # "._*"
+  # ".DS_Store"
+  # "Thumbs.db"
+  # "#snapshot"
+)
+
+# Docker stack management for this object (DB dumps + stop/start of stacks for a
+# consistent backup). Default OFF: the path is backed up without touching any
+# containers (crash-consistent backup of running data).
+# Set to "true" to treat BACKUP_PATH as a base directory of Docker stacks: the
+# script then runs each selected stack's db-dump.sh, stops it, and starts it
+# again. As soon as ANY instance has DOCKER=true, docker plus the Compose V2
+# plugin are required (and checked at startup).
+DOCKER=false
+# DOCKER=true
+
+# Stacks that are stopped and then started again for a consistent backup
+# (sub-directory names under BACKUP_PATH). Only relevant when DOCKER=true.
+# IMPORTANT: controls ONLY stop/start (and the DB dumps) — NOT what is backed
+# up. The whole of BACKUP_PATH is always backed up, including stacks that are
+# already stopped/inactive.
+#   EMPTY     = all stacks under BACKUP_PATH are stopped and started again.
+#   Populated = only the listed stacks are stopped/started; all others
+#               (e.g. permanently stopped ones) are left untouched but backed up.
+STOP_STACKS=(
+  # "solidtime"
+  # "nextcloud"
+)

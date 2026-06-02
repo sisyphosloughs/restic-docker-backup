@@ -1,10 +1,18 @@
 # Host-spezifische Konfiguration und Geheimnisse — nie committen
-config.sh
+global.conf
+instances/*.conf
 repos.conf
 repo.password
+# Templates bleiben versionie
+!*.conf.example
+# Altlast (durch global.conf + instances/ ersetzt) — falls noch vorhanden
+config.sh
 
 # Laufzeit-Logs
 logs/
+
+# Local test files
+test/
 
 # Mutagen-Sync
 mutagen.yml.lock

@@ -3,12 +3,30 @@
 # Copy to "config.sh" and adjust. Sourced by restic-backup.sh based on
 # SCRIPT_DIR. SCRIPT_DIR is available here.
 
-# Base path of all Docker stacks
+# Base path of all Docker stacks (always backed up — see EXTRA_PATHS for more).
 STACKS_BASE="/opt/containers"           # e.g. on a VPS
 # STACKS_BASE="/srv/docker"             # e.g. on a NAS
 
+# Dry run (default OFF). When "true", restic runs the backup with
+# --dry-run --verbose=2: nothing is written and a per-file listing of what
+# *would* be backed up (incl. which files your excludes skip) is written to the
+# log. forget/prune and the monthly repository check are skipped. Useful to
+# verify paths/excludes before a real run.
+DRY_RUN=false
+# DRY_RUN=true
+
+# Docker stack management (DB dumps + stop/start of stacks for a consistent
+# backup). Default OFF: the script then only backs up the configured paths
+# without touching any containers (crash-consistent backup of running data).
+# Set to "true" to have the script run db-dump.sh and stop/start the stacks
+# selected via STOP_STACKS. Only when this is enabled are docker and the Compose
+# V2 plugin required (and checked at startup).
+DOCKER_STACKS_ENABLED=false
+# DOCKER_STACKS_ENABLED=true
+
 # Stacks that are stopped and then started again for a consistent backup
-# (directory names under STACKS_BASE).
+# (directory names under STACKS_BASE). Only relevant when
+# DOCKER_STACKS_ENABLED=true.
 # IMPORTANT: controls ONLY stop/start (and the DB dumps) — NOT what is backed
 # up. The whole of STACKS_BASE is always backed up, including stacks that are
 # already stopped/inactive.
@@ -23,15 +41,29 @@ STOP_STACKS=(
 # Path to the repository list
 REPOS_FILE="$SCRIPT_DIR/repos.conf"
 
+# Absolute paths to the restic / rclone binaries (optional).
+# Leave empty to use whatever is found in PATH (recommended on most hosts).
+# On some hosts — e.g. a NAS — the binaries live in a non-standard location
+# (such as /volume1/opt/bin) that is not in the (cron) PATH; set the absolute
+# path then. restic launches rclone as a subprocess and is told which binary to
+# use via this path, so rclone does NOT need to be in PATH either.
+# The availability of all required programs is checked and logged at startup.
+RESTIC_BIN=""
+# RESTIC_BIN="/volume1/opt/bin/restic"
+RCLONE_BIN=""
+# RCLONE_BIN="/volume1/opt/bin/rclone"
+
 # rclone configuration file (only relevant for "rclone:" targets).
 # This script runs as root. "rclone config", however, is usually run as a normal
 # user — then the rclone.conf is in that user's home
 # (~/.config/rclone/rclone.conf) and is NOT visible to root. Consequence: all
 # rclone targets are treated as "not reachable".
-# Remedy: set the absolute path to the rclone.conf here; the script exports it
-# as RCLONE_CONFIG for rclone and restic. Leave empty = rclone default path of
-# the executing user (root). It is recommended to run "rclone config" as root
-# straight away — then this entry can stay empty.
+# Remedy: set the absolute path to the rclone.conf here; the script then passes
+# it explicitly via "--config" to every rclone call and to restic's rclone
+# subprocess (rclone does not reliably read it from the environment). The path
+# must be readable by root and must NOT contain spaces. Leave empty = rclone
+# default path of the executing user (root). It is recommended to run
+# "rclone config" as root straight away — then this entry can stay empty.
 RCLONE_CONFIG_FILE=""
 # RCLONE_CONFIG_FILE="/home/USER/.config/rclone/rclone.conf"
 
@@ -43,6 +75,19 @@ RESTIC_PASSWORD_FILE="$SCRIPT_DIR/repo.password"
 EXTRA_PATHS=(
   # "/srv/photos"
   # "/srv/documents"
+)
+
+# Exclude patterns (optional), passed verbatim to restic's --exclude and
+# applied across all backup paths. Uses restic's exclude syntax (glob, ** for
+# any depth). A pattern WITHOUT a leading "/" matches its basename at any depth;
+# a pattern WITH a leading "/" is anchored to that absolute path. Leave empty if
+# not needed.
+#   "@eaDir"                  -> excludes every "@eaDir" folder (Synology) at any depth
+#   "*.tmp"                   -> excludes all *.tmp files anywhere
+#   "/srv/documents/**/cache" -> excludes cache dirs only under /srv/documents
+EXTRA_EXCLUDES=(
+  # "@eaDir"
+  # "/srv/documents/**/cache"
 )
 
 # Telegram notification (leave empty/"xxx" to disable)

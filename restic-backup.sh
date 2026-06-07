@@ -96,32 +96,21 @@ contains() {
   return 1
 }
 
-instance_docker_enabled() {
-  # Whether an instance's DOCKER flag is turned on. Accepts the usual truthy
-  # spellings; everything else (incl. unset/empty) is treated as off.
+is_truthy() {
   case "${1:-false}" in
     1|true|TRUE|True|yes|YES|Yes|on|ON) return 0 ;;
     *) return 1 ;;
   esac
 }
 
+instance_docker_enabled() { is_truthy "${1:-}"; }
+
 any_docker_enabled() {
-  # Whether the optional Docker stack orchestration (DB dumps + stop/start) runs
-  # at all — true as soon as at least one instance has DOCKER=true. Replaces the
-  # former global DOCKER_STACKS_ENABLED switch.
+  # True as soon as at least one instance has DOCKER=true (set by load_instances).
   [[ "${ANY_DOCKER:-0}" -eq 1 ]]
 }
 
-dry_run_enabled() {
-  # When enabled, restic runs the backup with --dry-run --verbose=2: nothing is
-  # written, and the per-file listing of what *would* be backed up goes to the
-  # log. The repository-modifying steps (forget/prune) and the monthly check
-  # are skipped. Controlled by DRY_RUN in global.conf; default off.
-  case "${DRY_RUN:-false}" in
-    1|true|TRUE|True|yes|YES|Yes|on|ON) return 0 ;;
-    *) return 1 ;;
-  esac
-}
+dry_run_enabled() { is_truthy "${DRY_RUN:-false}"; }
 
 has_rclone_targets() {
   # Returns 0 if at least one "rclone:" target is configured in REPOS_FILE.
@@ -227,7 +216,7 @@ load_instances() {
 
     # shellcheck source=/dev/null
     source "$conf"
-    name="$(basename "${conf%.conf}")"
+    name="${conf##*/}"; name="${name%.conf}"
     found=$((found + 1))
 
     if [[ -z "$BACKUP_PATH" ]]; then
@@ -369,7 +358,7 @@ fi
 REPOS=()
 while IFS= read -r line || [[ -n "$line" ]]; do
   line="${line%%#*}"                 # remove comments
-  line="$(echo "$line" | xargs)"     # trim whitespace
+  read -r line <<< "$line"           # trim leading/trailing whitespace (pure bash)
   [[ -z "$line" ]] && continue
   REPOS+=("$line")
 done < "$REPOS_FILE"
@@ -391,11 +380,11 @@ telegram_send() {
   fi
   # Telegram limit: 4096 characters
   text="${text:0:4096}"
-  if ! curl -sS --max-time 30 \
+  if ! curl -s --max-time 30 \
       -o /dev/null \
       "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
       --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-      --data-urlencode "text=${text}" >/dev/null 2>&1; then
+      --data-urlencode "text=${text}"; then
     log "ERROR" "Telegram notification could not be sent"
   fi
 }
@@ -521,25 +510,29 @@ repo_reachable() {
 
 CLEAN_EXIT=0
 
-cleanup() {
-  local rc=$?
-  # Only on unexpected abort (not a regular exit via finish())
-  if [[ "$CLEAN_EXIT" -eq 1 ]]; then
-    return
-  fi
-
-  log_error "Unexpected abort (exit code $rc) — bringing stopped stacks back up"
-
+start_stopped_stacks() {
+  # Starts every stack that was stopped during this run and clears STOPPED_STACKS
+  # so the EXIT trap does not restart them a second time.
   local stack_dir stack
-  for stack_dir in "${STOPPED_STACKS[@]:-}"; do
+  for stack_dir in "${STOPPED_STACKS[@]+"${STOPPED_STACKS[@]}"}"; do
     [[ -z "$stack_dir" ]] && continue
     stack="$(basename "$stack_dir")"
     if (cd "$stack_dir" && docker compose start) >>"$LOG_FILE" 2>&1; then
-      log_info "$stack: stack restarted after abort"
+      log_info "$stack: stack started"
     else
-      log "ERROR" "$stack: stack could NOT be started after abort (manual intervention needed)"
+      log_error "$stack: stack could not be started (manual intervention needed)"
     fi
   done
+  STOPPED_STACKS=()
+}
+
+cleanup() {
+  local rc=$?
+  # Only on unexpected abort (not a regular exit via finish())
+  [[ "$CLEAN_EXIT" -eq 1 ]] && return
+
+  log_error "Unexpected abort (exit code $rc) — bringing stopped stacks back up"
+  start_stopped_stacks
 
   telegram_send "$(printf '❌ [%s] Backup ABORTED\n\n--- Log (last 50 lines) ---\n%s' \
     "$HOSTNAME_SHORT" "$(log_tail)")"
@@ -698,7 +691,7 @@ for repo in "${REPOS[@]}"; do
   if [[ -n "$summary_line" ]]; then
     if [[ "$have_jq" -eq 1 ]]; then
       bytes="$(printf '%s' "$summary_line" | jq -r '.total_bytes_processed // 0')"
-      snapshot="$(printf '%s' "$summary_line" | jq -r '.snapshot_id // "?"' | cut -c1-8)"
+      snapshot="$(printf '%s' "$summary_line" | jq -r '(.snapshot_id // "?")[0:8]')"
     else
       bytes="$(printf '%s' "$summary_line" | grep -o '"total_bytes_processed":[0-9]*' | grep -o '[0-9]*')"
       snapshot="$(printf '%s' "$summary_line" | grep -o '"snapshot_id":"[a-f0-9]*"' | grep -o '[a-f0-9]\{8\}' | head -n1)"
@@ -723,17 +716,7 @@ done
 
 if any_docker_enabled; then
   log_info "--- Starting stacks ---"
-  for stack_dir in "${STOPPED_STACKS[@]:-}"; do
-    [[ -z "$stack_dir" ]] && continue
-    stack="$(basename "$stack_dir")"
-    if (cd "$stack_dir" && docker compose start) >>"$LOG_FILE" 2>&1; then
-      log_info "$stack: stack started (wait for health check)"
-    else
-      log_error "$stack: stack could not be started (manual intervention needed)"
-    fi
-  done
-  # Stacks are back up — the trap should not touch them again
-  STOPPED_STACKS=()
+  start_stopped_stacks
 fi
 
 # ---------------------------------------------------------------------------
@@ -744,7 +727,7 @@ log_info "--- Forget & Prune ---"
 if dry_run_enabled; then
   log_info "Skipped (dry run) — no snapshots are removed"
 else
-  for repo in "${REACHABLE_REPOS[@]:-}"; do
+  for repo in "${REACHABLE_REPOS[@]+"${REACHABLE_REPOS[@]}"}"; do
     [[ -z "$repo" ]] && continue
     if restic_repo "$repo" forget \
         --tag "$HOSTNAME_SHORT" \
@@ -767,7 +750,7 @@ if [[ "$(date +%d)" == "01" ]]; then
     log_info "--- Repository check (monthly) --- skipped (dry run)"
   else
     log_info "--- Repository check (monthly) ---"
-    for repo in "${REACHABLE_REPOS[@]:-}"; do
+    for repo in "${REACHABLE_REPOS[@]+"${REACHABLE_REPOS[@]}"}"; do
       [[ -z "$repo" ]] && continue
       if restic_repo "$repo" check >>"$LOG_FILE" 2>&1; then
         log_info "$repo: check ok"

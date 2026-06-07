@@ -23,7 +23,9 @@ repository list, Telegram, …) live in `global.conf`.
 │   └── <name>.conf              # e.g. containers.conf, audiobooks.conf
 ├── repos.conf                   # host-specific repository list (from repos.conf.example)
 ├── repo.password                # restic password (chmod 600, owned by root)
-├── examples/                    # example DB dump scripts
+├── lib/
+│   └── db-dump-lib.sh           # shared DB-dump library, sourced by each stack's db-dump.sh
+├── examples/                    # thin db-dump.sh templates to copy into a stack (postgres/mariadb/sqlite)
 └── logs/                        # one log file per run (auto-rotated), created by the script
 ```
 
@@ -130,9 +132,27 @@ The Docker orchestration runs as soon as **at least one** instance has
 7. **Set up DB dumps** (optional, per stack; requires a Docker instance with
    `DOCKER=true`):
    Place an executable `db-dump.sh` in each stack directory. Templates are in
-   [examples/](examples/). `STACK_NAME` is set by the backup script as an
-   environment variable. The dump must be written to the bind mount `db-dumps/`
-   (`/tmp/dumps` inside the container) so that it is backed up as well.
+   [examples/](examples/) (PostgreSQL, MariaDB/MySQL, SQLite). They are **thin
+   wrappers**: the generic logic — creating `db-dumps/`, deleting old dumps
+   (retention), timestamped filenames and logging — lives once in
+   [lib/db-dump-lib.sh](lib/db-dump-lib.sh), which each wrapper `source`s. A
+   wrapper only supplies the DB-specific call (e.g. `dump_postgres database-1`).
+
+   Two settings live in each wrapper:
+
+   - `DB_DUMP_LIB` — path to the shared library. `restic-backup.sh` passes its
+     own bundled `lib/db-dump-lib.sh` automatically; the default in the wrapper
+     only matters for **standalone** runs (`./db-dump.sh`) — adjust it to where
+     you placed restic-docker-backup.
+   - `RETENTION_DAYS` — how many days dumps are kept (rotation), set **per
+     stack**. There is deliberately no global value, so each `db-dump.sh` is
+     self-contained and can be tested on its own.
+
+   For the server databases (PostgreSQL, MariaDB) the dump is written to the bind
+   mount `db-dumps/` (`/tmp/dumps` inside the container) so it is backed up as
+   well. SQLite has no server: the dump runs on the host and writes straight into
+   `db-dumps/`. `STACK_NAME` (container prefix) is set by the backup script;
+   `STACK_DIR` is derived automatically.
 
 ## Docker stack management (`DOCKER`)
 

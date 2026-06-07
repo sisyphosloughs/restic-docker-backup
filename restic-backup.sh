@@ -586,7 +586,11 @@ else
     dump_script="$stack_dir/db-dump.sh"
 
     if [[ -x "$dump_script" ]]; then
-      if STACK_NAME="$stack" "$dump_script" >>"$LOG_FILE" 2>&1; then
+      # Pass the bundled shared library so the dump uses this repo's
+      # lib/db-dump-lib.sh regardless of the wrapper's standalone default. The
+      # retention (RETENTION_DAYS) is deliberately left to the per-stack script.
+      if STACK_NAME="$stack" DB_DUMP_LIB="$SCRIPT_DIR/lib/db-dump-lib.sh" \
+          "$dump_script" >>"$LOG_FILE" 2>&1; then
         log_info "$stack: DB dump successful"
       else
         log_error "$stack: DB dump failed (exit $?)"

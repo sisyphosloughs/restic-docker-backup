@@ -20,6 +20,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DUMP_DIR="$SCRIPT_DIR/db-dumps"
 
+# How many days each dump is kept. On every run, dumps in DUMP_DIR older than
+# this are removed; newer ones (incl. the one just written) are kept.
+RETENTION_DAYS=30
+
 # Log in the same format as restic-backup.sh ("<ts> [LEVEL] msg"). No log file is
 # written here — restic-backup.sh captures this script's stdout/stderr.
 log() {
@@ -31,13 +35,12 @@ log() {
 command -v sqlite3 >/dev/null 2>&1 \
   || { log ERROR "${STACK_NAME:-sqlite}: sqlite3 not found on the host"; exit 1; }
 
-# Start each run with a clean dump directory — remove all previous dumps so they
-# do not pile up. Done ONCE here, before any dump_sqlite call (otherwise the
-# second database would delete the first one's dump).
+# Remove dumps older than RETENTION_DAYS so they do not pile up forever, while
+# keeping recent ones. Done ONCE here, before any dump_sqlite call.
 mkdir -p "$DUMP_DIR" \
   || { log ERROR "${STACK_NAME:-sqlite}: cannot create dump directory $DUMP_DIR"; exit 1; }
-find "$DUMP_DIR" -mindepth 1 -delete
-log INFO "${STACK_NAME:-sqlite}: cleared old dumps in $DUMP_DIR"
+find "$DUMP_DIR" -maxdepth 1 -type f -mtime +"$RETENTION_DAYS" -delete
+log INFO "${STACK_NAME:-sqlite}: removed dumps older than ${RETENTION_DAYS} days in $DUMP_DIR"
 
 dump_sqlite() {
   # dump_sqlite <path-to-db-file> — consistent online backup into DUMP_DIR; the

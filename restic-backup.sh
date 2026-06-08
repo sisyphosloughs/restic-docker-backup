@@ -34,7 +34,8 @@ REACHABLE_REPOS=()
 # Aggregated from the instance configurations (see load_instances)
 BACKUP_PATHS=()        # all BACKUP_PATHs to back up (one snapshot per repo)
 EXCLUDE_PATTERNS=()    # anchored excludes collected from all instances
-STACK_DIRS=()          # full paths of stacks to stop/start/dump (DOCKER=true)
+STACK_DIRS=()          # full paths of stacks to stop/start (DOCKER=true)
+DUMP_DIRS=()           # sub-stacks scanned for db-dump.sh (DOCKER=true), independent of STOP_STACKS
 ANY_DOCKER=0           # 1 if at least one instance has DOCKER=true
 
 # ---------------------------------------------------------------------------
@@ -185,7 +186,9 @@ load_instances() {
   #                            treated as a base dir whose sub-directories are
   #                            stacks)
   #   STOP_STACKS   (array)    sub-directory names to stop/start (empty = all);
-  #                            only relevant when DOCKER=true
+  #                            only relevant when DOCKER=true. Does NOT gate the
+  #                            DB dumps — those run for every sub-stack with an
+  #                            executable db-dump.sh regardless of this list.
   #
   # NOTE: the per-object path variable is BACKUP_PATH, NOT PATH — using the name
   # "PATH" would clobber the shell's executable search path and break the run.
@@ -199,8 +202,11 @@ load_instances() {
   #                      snapshot per repo)
   #   EXCLUDE_PATTERNS[] union of all EXCLUDES, deduplicated (restic applies
   #                      --exclude across every path of the single backup call)
-  #   STACK_DIRS[]       full paths of the stacks to stop/start/dump across all
-  #                      DOCKER=true instances
+  #   STACK_DIRS[]       full paths of the stacks to stop/start across all
+  #                      DOCKER=true instances (STOP_STACKS selection)
+  #   DUMP_DIRS[]        full paths of every sub-stack of a DOCKER=true instance,
+  #                      scanned for an executable db-dump.sh (NOT gated by
+  #                      STOP_STACKS — dumping a live DB needs no stop)
   #   ANY_DOCKER         1 if at least one instance has DOCKER=true
   local conf name pat base s d found=0
 
@@ -257,6 +263,16 @@ load_instances() {
 
     if instance_docker_enabled "$DOCKER"; then
       ANY_DOCKER=1
+
+      # DB dumps are independent of STOP_STACKS: every sub-stack of this base is
+      # a dump candidate (the dump step itself only runs the ones that actually
+      # ship an executable db-dump.sh). Dumping a live DB needs no container
+      # stop, so this list is built from ALL sub-directories regardless of the
+      # STOP_STACKS selection below.
+      for d in "$BACKUP_PATH"/*/; do
+        [[ -d "$d" ]] && DUMP_DIRS+=("${d%/}")
+      done
+
       if [[ "${#STOP_STACKS[@]}" -gt 0 ]]; then
         log_info "Instance '$name' (DOCKER): base $BACKUP_PATH — stop/start only: ${STOP_STACKS[*]}"
         for s in "${STOP_STACKS[@]}"; do
@@ -316,8 +332,8 @@ source "$GLOBAL_CONF"
 : "${DRY_RUN:=false}"
 
 # Collect all instance configurations (sets BACKUP_PATHS, EXCLUDE_PATTERNS,
-# STACK_DIRS and ANY_DOCKER). Done before check_binaries so the docker/compose
-# check only runs when at least one instance actually uses DOCKER.
+# STACK_DIRS, DUMP_DIRS and ANY_DOCKER). Done before check_binaries so the
+# docker/compose check only runs when at least one instance actually uses DOCKER.
 INSTANCES_DIR="$SCRIPT_DIR/instances"
 load_instances
 
@@ -565,10 +581,14 @@ done
 
 # ---------------------------------------------------------------------------
 # 2.–3. Docker stack management (optional — runs only if at least one instance
-# has DOCKER=true). STACK_DIRS was assembled while loading the instances: for
-# every DOCKER=true instance it holds the stack directories to stop/start (its
-# STOP_STACKS selection, or all sub-directories of its BACKUP_PATH when empty).
-# This affects ONLY stop/start/dumps — regardless of it, every instance's
+# has DOCKER=true). Two independent selections were assembled while loading the
+# instances:
+#   DUMP_DIRS   every sub-stack of a DOCKER=true instance — DB dumps run for any
+#               of these that ships an executable db-dump.sh (NOT gated by
+#               STOP_STACKS; a live DB dump needs no stop).
+#   STACK_DIRS  the stacks to stop/start (each instance's STOP_STACKS selection,
+#               or all sub-directories of its BACKUP_PATH when empty).
+# Neither affects WHAT is backed up: regardless of both, every instance's
 # BACKUP_PATH is always backed up in full (see backup step), including stacks
 # that are already stopped/inactive.
 # When no instance uses DOCKER (default), this whole part is skipped and the
@@ -578,9 +598,10 @@ done
 if ! any_docker_enabled; then
   log_info "No instance has DOCKER=true — no DB dumps, no stop/start; data is backed up while containers keep running"
 else
-  # DB dumps
+  # DB dumps — run for every sub-stack that ships an executable db-dump.sh,
+  # independent of STOP_STACKS (see DUMP_DIRS).
   log_info "--- DB dumps ---"
-  for stack_dir in "${STACK_DIRS[@]+"${STACK_DIRS[@]}"}"; do
+  for stack_dir in "${DUMP_DIRS[@]+"${DUMP_DIRS[@]}"}"; do
     [[ -d "$stack_dir" ]] || continue
     stack="$(basename "$stack_dir")"
     dump_script="$stack_dir/db-dump.sh"

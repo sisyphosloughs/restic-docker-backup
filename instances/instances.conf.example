@@ -48,17 +48,20 @@ EXCLUDES=(
 # consistent backup). Default OFF: the path is backed up without touching any
 # containers (crash-consistent backup of running data).
 # Set to "true" to treat BACKUP_PATH as a base directory of Docker stacks: the
-# script then runs each selected stack's db-dump.sh, stops it, and starts it
-# again. As soon as ANY instance has DOCKER=true, docker plus the Compose V2
-# plugin are required (and checked at startup).
+# script then runs each sub-stack's db-dump.sh (if present), stops the selected
+# stacks, and starts them again. As soon as ANY instance has DOCKER=true, docker
+# plus the Compose V2 plugin are required (and checked at startup).
+# NOTE: DB dumps run for EVERY sub-stack that ships an executable db-dump.sh,
+# independent of STOP_STACKS below — dumping a live DB needs no container stop.
 DOCKER=false
 # DOCKER=true
 
 # Stacks that are stopped and then started again for a consistent backup
 # (sub-directory names under BACKUP_PATH). Only relevant when DOCKER=true.
-# IMPORTANT: controls ONLY stop/start (and the DB dumps) — NOT what is backed
-# up. The whole of BACKUP_PATH is always backed up, including stacks that are
-# already stopped/inactive.
+# IMPORTANT: controls ONLY stop/start — NOT the DB dumps (those run for every
+# sub-stack with a db-dump.sh) and NOT what is backed up. The whole of
+# BACKUP_PATH is always backed up, including stacks that are already
+# stopped/inactive.
 #   EMPTY     = all stacks under BACKUP_PATH are stopped and started again.
 #   Populated = only the listed stacks are stopped/started; all others
 #               (e.g. permanently stopped ones) are left untouched but backed up.

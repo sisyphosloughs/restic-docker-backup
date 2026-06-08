@@ -151,13 +151,19 @@ The Docker orchestration runs as soon as **at least one** instance has
    target container through `docker compose` run **from the stack directory**, so
    a custom `container_name:` or project name no longer matters and the dump is
    streamed straight to `db-dumps/` on the host — **no bind mount and no
-   docker-compose.yml change are needed.** SQLite has no server: that dump runs on
-   the host and writes straight into `db-dumps/`.
+   docker-compose.yml change are needed.** The right container is picked by its
+   image name, its exposed port (5432/3306) or its `POSTGRES_*` / `MYSQL_*` /
+   `MARIADB_*` env vars, so Postgres/MySQL **derivatives** (pgvecto-rs, pgvector,
+   postgis, timescale, percona, …) are found too even though their image name
+   lacks the keyword. SQLite has no server: that dump runs on the host and writes
+   straight into `db-dumps/`.
 
-   Per-stack overrides are plain variables set **before** the call (only needed
-   when auto-detection or the default credentials are wrong):
+   Per-stack overrides are plain variables that must be set **before** the dump
+   call (only needed when auto-detection or the default credentials are wrong):
 
-   - `DB_SERVICE` — pin a specific compose service (e.g. several DBs in one stack).
+   - `DB_SERVICE` — pin a specific compose **service** (the key under `services:`
+     in `docker-compose.yml`, **not** a `container_name:`). Use it e.g. when a
+     stack runs several databases.
    - `DB_CONTAINER` — a raw container name/id, bypassing compose entirely.
    - `DB_USER` / `DB_NAME` / `DB_PASSWORD` — set credentials explicitly. Otherwise
      they are resolved **inside the container** from the common env vars and their

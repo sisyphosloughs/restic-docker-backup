@@ -57,7 +57,9 @@ dump_prepare() {
 # edits. Resolution order (most explicit first):
 #   DB_CONTAINER  raw container name/id, used verbatim (bypasses compose)
 #   DB_SERVICE / first arg   a compose service name -> docker compose ps -q
-#   auto-detect   the project's running container whose image matches the engine
+#   auto-detect   the project's running container that looks like the engine
+#                 (image name / exposed port / engine env var — so postgres
+#                 derivatives like pgvecto-rs are found too)
 #
 # The dump is streamed to db-dumps/ ON THE HOST via "docker exec ... > file", so
 # no bind mount (db-dumps/ -> /tmp/dumps) is required inside the container.
@@ -72,11 +74,11 @@ _compose() {
 _resolve_container() {
   # _resolve_container <engine> [service]
   # Echoes exactly one container id on stdout, or logs an actionable error and
-  # returns 1. <engine> is "postgres" or "mysql" (selects the image match).
+  # returns 1. <engine> is "postgres" or "mysql" (selects the detection signals).
   # Command substitutions are captured in their own statement and guarded with
   # "|| true" so a non-match never trips `set -e`; emptiness is then tested.
   local engine="$1" service="${2:-${DB_SERVICE:-}}"
-  local cid="" ids id img pattern matches=()
+  local cid="" ids id img img_re port env_re ports envs matches=()
 
   command -v docker >/dev/null 2>&1 \
     || { log ERROR "${STACK_NAME}: docker not found on the host"; return 1; }
@@ -96,20 +98,31 @@ _resolve_container() {
     printf '%s\n' "$cid"; return 0
   fi
 
-  # 3. Auto-detect by image among the project's running containers.
+  # 3. Auto-detect among the project's running containers. The image NAME alone
+  # is unreliable: postgres derivatives (pgvecto-rs, pgvector, postgis, …) carry
+  # no "postgres" in the name. So a container counts as the engine if ANY of
+  # three signals match: a broadened image pattern, the engine's exposed port
+  # (derivatives inherit EXPOSE 5432/3306 from the base image), or the engine's
+  # telltale env var prefix.
   ids="$(_compose ps -q 2>/dev/null)" || true
   [[ -z "$ids" ]] && { log ERROR "${STACK_NAME}: no running compose containers in ${STACK_DIR} (is the stack up?)"; return 1; }
 
   case "$engine" in
-    postgres) pattern='[Pp]ostgres' ;;
-    mysql)    pattern='[Mm]aria|[Mm]ysql' ;;
+    postgres) img_re='[Pp]ostgres|pgvecto|pgvector|postgis|timescale|citus|supabase'
+              port='5432/'; env_re='^POSTGRES_' ;;
+    mysql)    img_re='[Mm]aria|[Mm]ysql|percona'
+              port='3306/'; env_re='^(MYSQL|MARIADB)_' ;;
     *)        log ERROR "${STACK_NAME}: unknown engine '${engine}'"; return 1 ;;
   esac
 
   while IFS= read -r id; do
     [[ -z "$id" ]] && continue
     img="$(docker inspect -f '{{.Config.Image}}' "$id" 2>/dev/null)" || continue
-    printf '%s' "$img" | grep -Eq "$pattern" && matches+=("$id")
+    if printf '%s' "$img" | grep -Eq "$img_re"; then matches+=("$id"); continue; fi
+    ports="$(docker inspect -f '{{range $p, $v := .Config.ExposedPorts}}{{println $p}}{{end}}' "$id" 2>/dev/null)" || ports=""
+    if printf '%s' "$ports" | grep -q "$port"; then matches+=("$id"); continue; fi
+    envs="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$id" 2>/dev/null)" || envs=""
+    if printf '%s\n' "$envs" | grep -Eq "$env_re"; then matches+=("$id"); continue; fi
   done <<< "$ids"
 
   if [[ "${#matches[@]}" -eq 0 ]]; then

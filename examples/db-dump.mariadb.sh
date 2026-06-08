@@ -28,12 +28,16 @@ source "$DB_DUMP_LIB"
 dump_prepare
 
 # --- the actual dump --------------------------------------------------------
-dump_mariadb             # auto-detect the mariadb/mysql container in this
-                         # compose project. Several DBs in this stack? Pin one
-                         # with DB_SERVICE=<compose-service> before this line.
+# Optional overrides — set ONE of these BEFORE the dump_mariadb call (only if
+# auto-detection or the default credentials are wrong). DB_SERVICE is the compose
+# SERVICE name (the key under "services:" in docker-compose.yml), NOT a
+# container_name:.
+# DB_SERVICE=database              # pin a specific compose service
+# DB_CONTAINER=my_mariadb          # raw container name/id (bypasses compose)
+# DB_USER=u DB_NAME=d DB_PASSWORD=s   # set credentials explicitly
 
-# Optional overrides (uncomment only if auto-detection / default creds are wrong):
-# DB_SERVICE=db          # pin a specific compose service
-# DB_CONTAINER=my-db     # use a raw container name/id (bypasses compose)
-# DB_USER=u DB_NAME=d DB_PASSWORD=s dump_mariadb    # set credentials explicitly
+# Auto-detects the mariadb/mysql container in this compose project (by image
+# name, exposed 3306 port, or MYSQL_*/MARIADB_* env — so percona and similar
+# variants are found too). Several DBs in this stack? Pin one with DB_SERVICE.
+dump_mariadb
 # ----------------------------------------------------------------------------

@@ -28,12 +28,16 @@ source "$DB_DUMP_LIB"
 dump_prepare
 
 # --- the actual dump --------------------------------------------------------
-dump_postgres            # auto-detect the postgres container in this compose
-                         # project. Several DBs in this stack? Pin one with
-                         # DB_SERVICE=<compose-service> before this line.
+# Optional overrides — set ONE of these BEFORE the dump_postgres call (only if
+# auto-detection or the default credentials are wrong). DB_SERVICE is the compose
+# SERVICE name (the key under "services:" in docker-compose.yml), NOT a
+# container_name:.
+# DB_SERVICE=database              # pin a specific compose service
+# DB_CONTAINER=my_postgres         # raw container name/id (bypasses compose)
+# DB_USER=u DB_NAME=d DB_PASSWORD=s   # set credentials explicitly
 
-# Optional overrides (uncomment only if auto-detection / default creds are wrong):
-# DB_SERVICE=db          # pin a specific compose service
-# DB_CONTAINER=my-pg     # use a raw container name/id (bypasses compose)
-# DB_USER=u DB_NAME=d DB_PASSWORD=s dump_postgres   # set credentials explicitly
+# Auto-detects the postgres container in this compose project (by image name,
+# exposed 5432 port, or POSTGRES_* env — so pgvector/pgvecto-rs/postgis/timescale
+# variants are found too). Several DBs in this stack? Pin one with DB_SERVICE.
+dump_postgres
 # ----------------------------------------------------------------------------

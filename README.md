@@ -21,7 +21,7 @@ repository list, Telegram, …) live in `global.conf`.
 ├── instances/                   # one *.conf per backed-up object
 │   ├── instances.conf.example   # template for an instance
 │   └── <name>.conf              # e.g. containers.conf, audiobooks.conf
-├── repos.conf                   # host-specific repository list (from repos.conf.example)
+├── repos.conf                   # host-specific repository list, optionally named (from repos.conf.example)
 ├── repo.password                # restic password (chmod 600, owned by root)
 ├── lib/
 │   └── db-dump-lib.sh           # shared DB-dump library, sourced by each stack's db-dump.sh
@@ -50,15 +50,19 @@ Configuration is split in two:
   | `EXCLUDES` | empty | restic exclude patterns anchored to this instance's `BACKUP_PATH` (see below). |
   | `DOCKER` | `false` | `true` → run `db-dump.sh` + stop/start the stacks under `BACKUP_PATH` for a consistent backup. |
   | `STOP_STACKS` | empty | Which sub-stacks to stop/start (empty = all); only relevant when `DOCKER=true`. |
+  | `TARGET_REPOS` | empty | Which repositories (by name from `repos.conf`) to back this instance up to (empty = **all** repos). See [Per-instance target repositories](#per-instance-target-repositories-target_repos). |
 
 > **Why `BACKUP_PATH` and not `PATH`?** `PATH` is the shell's executable search
 > path — a config file that set `PATH=…` would break command lookup for the rest
 > of the run. The per-object variable is therefore `BACKUP_PATH`.
 
-**How the instances are combined:** all `BACKUP_PATH`s across all instances are
-backed up **together in one `restic backup` call per repository** — one snapshot
-per repo. Each instance's `EXCLUDES` are **anchored to its own `BACKUP_PATH`**
-by the script, so a pattern only affects the path it was defined for (see
+**How the instances are combined:** by default every instance goes to **every**
+repository in `repos.conf`. Each repository is backed up with **one `restic
+backup` call** containing exactly the `BACKUP_PATH`s of the instances that target
+it (one snapshot per repo) — with `TARGET_REPOS` left empty everywhere this is
+all instances, identical to the previous behaviour. Each instance's `EXCLUDES`
+are **anchored to its own `BACKUP_PATH`** by the script, so a pattern only
+affects the path it was defined for (see
 [Backup paths and excludes](#backup-paths-and-excludes-backup_path--excludes)).
 The Docker orchestration runs as soon as **at least one** instance has
 `DOCKER=true`.
@@ -240,12 +244,49 @@ that they are not started by mistake — they are backed up regardless.
 A listed but non-existent stack is logged as an error and skipped (the run does
 not abort).
 
+## Per-instance target repositories (`TARGET_REPOS`)
+
+By default every instance is backed up to **all** repositories in `repos.conf`.
+`TARGET_REPOS` lets an instance pick **which** repositories it goes to — useful
+when, say, large media should only land in the cheap local repo while documents
+go to every off-site repo.
+
+Repositories are referenced **by name**. In `repos.conf` a line may carry an
+optional name:
+
+```text
+# repos.conf
+nextcloud = rclone:nextcloud:restic-milos     # named → referenceable as "nextcloud"
+ikaria    = rclone:ikaria-backup:/srv/restic  # named → "ikaria"
+/mnt/backup/restic-host                       # bare URL → name is the URL itself
+```
+
+Then in an instance:
+
+```bash
+# instances/containers.conf — only to nextcloud + ikaria
+BACKUP_PATH="/opt/containers"
+TARGET_REPOS=(
+  "nextcloud"
+  "ikaria"
+)
+```
+
+- **`TARGET_REPOS` empty / omitted** → all repositories (default, unchanged
+  behaviour).
+- **Populated** → only the named repositories; each repo's snapshot then contains
+  only the `BACKUP_PATH`s of the instances that target it.
+- An **unknown name** is logged as an error and ignored; an instance left with
+  **no valid target** is skipped (not backed up).
+- A repository that **no instance targets** receives no snapshot (logged as
+  "skipped"); it is also not touched by forget/prune or the monthly check.
+
 ## Backup paths and excludes (`BACKUP_PATH` / `EXCLUDES`)
 
-Each instance contributes its `BACKUP_PATH`; all of them are backed up together
-(one snapshot per repo). `EXCLUDES` holds exclude patterns that apply **only
-under this instance's `BACKUP_PATH`** — patterns from different instances do not
-interfere with each other.
+Each instance contributes its `BACKUP_PATH`; the instances targeting a repository
+are backed up together into it (one snapshot per repo). `EXCLUDES` holds exclude
+patterns that apply **only under this instance's `BACKUP_PATH`** — patterns from
+different instances do not interfere with each other.
 
 ```bash
 # instances/documents.conf
@@ -333,8 +374,9 @@ The log and the Telegram message are marked with `[DRY RUN]`. Set it back to
    check program availability, delete old logs, unlock repos
 2. Run DB dumps per stack — *only if at least one instance has `DOCKER=true`*
 3. Stop stacks (`docker compose stop`) — *only if `DOCKER=true` instances exist*
-4. Back up all instance `BACKUP_PATH`s (with merged excludes) to each reachable
-   target — one snapshot per repo
+4. For each reachable repository, back up the `BACKUP_PATH`s of the instances
+   that target it (with their anchored excludes) — one snapshot per repo. A repo
+   that no instance targets is skipped.
 5. Start stacks again (`docker compose start`) — *only if `DOCKER=true` instances exist*
 6. `restic forget --prune` (keep-daily 31, keep-monthly 99)
 7. `restic check` — monthly only (on the 1st)

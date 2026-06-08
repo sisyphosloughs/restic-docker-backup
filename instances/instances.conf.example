@@ -5,16 +5,17 @@
 # instance name shown in the log. restic-backup.sh collects every "*.conf" file
 # in this directory; this ".example" file is ignored.
 #
-# Each file is sourced on its own with the four variables below reset
-# beforehand, so values never leak between instances. Leave a variable out to
-# get its default.
+# Each file is sourced on its own with the variables below reset beforehand, so
+# values never leak between instances. Leave a variable out to get its default.
 #
-# All BACKUP_PATHs across all instances are backed up together — one restic
-# snapshot per repository. EXCLUDES from this file apply ONLY under this
-# instance's BACKUP_PATH: the script anchors every relative pattern to
-# BACKUP_PATH automatically, so "@eaDir" here only matches under THIS path and
-# not under any other instance's path. A pattern with a leading "/" is used
-# verbatim (you anchor it yourself — useful for cross-path or absolute excludes).
+# By default an instance is backed up to ALL repositories listed in repos.conf.
+# Use TARGET_REPOS (see below) to send an instance only to specific repositories.
+# Every repository receives one restic snapshot containing exactly the
+# BACKUP_PATHs of the instances that target it. EXCLUDES from this file apply
+# ONLY under this instance's BACKUP_PATH: the script anchors every relative
+# pattern to BACKUP_PATH automatically, so "@eaDir" here only matches under THIS
+# path and not under any other instance's path. A pattern with a leading "/" is
+# used verbatim (you anchor it yourself — useful for cross-path/absolute excludes).
 
 # Directory to back up (REQUIRED).
 #
@@ -68,4 +69,17 @@ DOCKER=false
 STOP_STACKS=(
   # "solidtime"
   # "nextcloud"
+)
+
+# Target repositories for THIS instance (optional). Names refer to the entries
+# in repos.conf (the "<name>" in a "<name> = <url>" line; a bare-URL line can be
+# referenced by its full URL). You may list one or several names.
+#   EMPTY / omitted = back up to ALL repositories in repos.conf (default).
+#   Populated       = back up only to the listed repositories.
+# Unknown names are reported as an error and ignored; an instance left with no
+# valid target is skipped (not backed up). A repository that no instance targets
+# receives no snapshot.
+TARGET_REPOS=(
+  # "nextcloud"
+  # "pcloud"
 )

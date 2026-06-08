@@ -31,12 +31,29 @@ SUCCESS_TARGETS=()
 # All reachable repos (for forget/prune/check)
 REACHABLE_REPOS=()
 
+# Repository list (parsed from repos.conf — see below). Two index-parallel
+# arrays: REPOS[i] is the restic URL, REPO_NAMES[i] its name/alias (used by an
+# instance's TARGET_REPOS to pick its destination; a bare-URL line gets the URL
+# itself as its name).
+REPOS=()
+REPO_NAMES=()
+
 # Aggregated from the instance configurations (see load_instances)
-BACKUP_PATHS=()        # all BACKUP_PATHs to back up (one snapshot per repo)
-EXCLUDE_PATTERNS=()    # anchored excludes collected from all instances
+BACKUP_PATHS=()        # union of all BACKUP_PATHs (overview log only)
+EXCLUDE_PATTERNS=()    # union of all anchored excludes (overview log only)
 STACK_DIRS=()          # full paths of stacks to stop/start (DOCKER=true)
 DUMP_DIRS=()           # sub-stacks scanned for db-dump.sh (DOCKER=true), independent of STOP_STACKS
 ANY_DOCKER=0           # 1 if at least one instance has DOCKER=true
+
+# Per-instance records (index-parallel) used to group backups by destination
+# repo: each repo is backed up with exactly the paths/excludes of the instances
+# that target it. INST_TARGETS[i] is a space-separated list of resolved repo
+# names; INST_EXCLUDES[i] is a newline-separated list of anchored patterns
+# (exclude patterns never contain newlines).
+INST_NAME=()
+INST_PATH=()
+INST_TARGETS=()
+INST_EXCLUDES=()
 
 # ---------------------------------------------------------------------------
 # Create the log directory and log file FIRST — so that configuration errors
@@ -189,26 +206,35 @@ load_instances() {
   #                            only relevant when DOCKER=true. Does NOT gate the
   #                            DB dumps — those run for every sub-stack with an
   #                            executable db-dump.sh regardless of this list.
+  #   TARGET_REPOS  (array)    repo names (from repos.conf) this instance backs up
+  #                            to (empty = ALL repos). Unknown names are dropped
+  #                            with an error; an instance left with no valid target
+  #                            is skipped.
   #
   # NOTE: the per-object path variable is BACKUP_PATH, NOT PATH — using the name
   # "PATH" would clobber the shell's executable search path and break the run.
   #
-  # Files are sourced one at a time with the four variables reset beforehand, so
-  # a value from one file never leaks into the next. Templates (*.example) are
-  # skipped (they do not end in .conf anyway).
+  # Files are sourced one at a time with the per-instance variables reset
+  # beforehand, so a value from one file never leaks into the next. Templates
+  # (*.example) are skipped (they do not end in .conf anyway).
   #
   # Aggregated into the globals used by the rest of the script:
-  #   BACKUP_PATHS[]     all valid BACKUP_PATHs (backed up together → one
-  #                      snapshot per repo)
-  #   EXCLUDE_PATTERNS[] union of all EXCLUDES, deduplicated (restic applies
-  #                      --exclude across every path of the single backup call)
+  #   INST_NAME[] / INST_PATH[] / INST_TARGETS[] / INST_EXCLUDES[]
+  #                      index-parallel per-instance records; the backup loop
+  #                      groups by destination repo via INST_TARGETS (resolved
+  #                      space-separated repo names) so each repo is backed up
+  #                      with only the paths/excludes of its instances.
+  #   BACKUP_PATHS[]     union of all valid BACKUP_PATHs (overview log only)
+  #   EXCLUDE_PATTERNS[] union of all anchored EXCLUDES, deduplicated (overview
+  #                      log only)
   #   STACK_DIRS[]       full paths of the stacks to stop/start across all
   #                      DOCKER=true instances (STOP_STACKS selection)
   #   DUMP_DIRS[]        full paths of every sub-stack of a DOCKER=true instance,
   #                      scanned for an executable db-dump.sh (NOT gated by
   #                      STOP_STACKS — dumping a live DB needs no stop)
   #   ANY_DOCKER         1 if at least one instance has DOCKER=true
-  local conf name pat base s d found=0
+  local conf name pat base s d t found=0
+  local inst_excl targets
 
   [[ -d "$INSTANCES_DIR" ]] || fatal "Instances directory not found: $INSTANCES_DIR"
 
@@ -217,8 +243,10 @@ load_instances() {
     case "$conf" in *.example) continue ;; esac  # skip templates (defensive)
 
     # Reset per-instance variables so nothing leaks between files.
+    # NOTE: the destination var is TARGET_REPOS, NOT REPOS (that is the global
+    # URL list parsed from repos.conf).
     local BACKUP_PATH="" DOCKER="false"
-    local EXCLUDES=() STOP_STACKS=()
+    local EXCLUDES=() STOP_STACKS=() TARGET_REPOS=()
 
     # shellcheck source=/dev/null
     source "$conf"
@@ -234,32 +262,70 @@ load_instances() {
       continue
     fi
 
-    BACKUP_PATHS+=("$BACKUP_PATH")
+    # Resolve this instance's destination repos. Empty TARGET_REPOS → all repos
+    # (consistent with STOP_STACKS: empty = all). Unknown names are dropped with
+    # an error; an instance left with no valid target is skipped entirely (so its
+    # data is not silently dropped without notice, and its containers are not
+    # stopped pointlessly).
+    if [[ "${#TARGET_REPOS[@]}" -eq 0 ]]; then
+      targets="${REPO_NAMES[*]}"
+    else
+      targets=""
+      for t in "${TARGET_REPOS[@]}"; do
+        [[ -z "$t" ]] && continue
+        if contains "$t" "${REPO_NAMES[@]+"${REPO_NAMES[@]}"}"; then
+          targets+="${targets:+ }$t"
+        else
+          log_error "Instance '$name': unknown TARGET_REPOS entry '$t' (not in repos.conf) — ignored"
+        fi
+      done
+    fi
+    if [[ -z "$targets" ]]; then
+      log_error "Instance '$name': no valid target repository, instance not backed up"
+      continue
+    fi
 
     # Anchor this instance's excludes to its BACKUP_PATH so they apply ONLY under
-    # that path. restic's --exclude is otherwise global across every path of the
-    # single backup call, so an unanchored basename pattern (e.g. @eaDir) would
-    # match under all instances. A pattern that already starts with "/" is taken
-    # verbatim (the user anchors it themselves — the escape hatch). A relative /
-    # basename pattern <pat> is emitted in two anchored forms so it matches at
-    # every depth under the base:
+    # that path. restic's --exclude is otherwise global across every path of a
+    # backup call, so an unanchored basename pattern (e.g. @eaDir) would match
+    # under all paths of that repo. A pattern that already starts with "/" is
+    # taken verbatim (the user anchors it themselves — the escape hatch). A
+    # relative / basename pattern <pat> is emitted in two anchored forms so it
+    # matches at every depth under the base:
     #   <base>/<pat>     directly in the base directory
     #   <base>/**/<pat>  at any depth below it
     # The explicit <base>/<pat> is a safety net in case restic's ** does not
-    # match zero directories. Patterns are deduplicated.
+    # match zero directories. Patterns are deduplicated within the instance.
     base="${BACKUP_PATH%/}"
+    inst_excl=()
     for pat in "${EXCLUDES[@]+"${EXCLUDES[@]}"}"; do
       [[ -z "$pat" ]] && continue
       if [[ "$pat" == /* ]]; then
-        contains "$pat" "${EXCLUDE_PATTERNS[@]+"${EXCLUDE_PATTERNS[@]}"}" \
-          || EXCLUDE_PATTERNS+=("$pat")
+        contains "$pat" "${inst_excl[@]+"${inst_excl[@]}"}" || inst_excl+=("$pat")
       else
-        contains "$base/$pat" "${EXCLUDE_PATTERNS[@]+"${EXCLUDE_PATTERNS[@]}"}" \
-          || EXCLUDE_PATTERNS+=("$base/$pat")
-        contains "$base/**/$pat" "${EXCLUDE_PATTERNS[@]+"${EXCLUDE_PATTERNS[@]}"}" \
-          || EXCLUDE_PATTERNS+=("$base/**/$pat")
+        contains "$base/$pat" "${inst_excl[@]+"${inst_excl[@]}"}" \
+          || inst_excl+=("$base/$pat")
+        contains "$base/**/$pat" "${inst_excl[@]+"${inst_excl[@]}"}" \
+          || inst_excl+=("$base/**/$pat")
       fi
     done
+    # Mirror into the EXCLUDE_PATTERNS union (overview log only).
+    for pat in "${inst_excl[@]+"${inst_excl[@]}"}"; do
+      contains "$pat" "${EXCLUDE_PATTERNS[@]+"${EXCLUDE_PATTERNS[@]}"}" \
+        || EXCLUDE_PATTERNS+=("$pat")
+    done
+
+    # Store the per-instance record for the per-repo grouping in the backup loop.
+    BACKUP_PATHS+=("$BACKUP_PATH")
+    INST_NAME+=("$name")
+    INST_PATH+=("$BACKUP_PATH")
+    INST_TARGETS+=("$targets")
+    if [[ "${#inst_excl[@]}" -gt 0 ]]; then
+      INST_EXCLUDES+=("$(printf '%s\n' "${inst_excl[@]}")")
+    else
+      INST_EXCLUDES+=("")
+    fi
+    log_info "Instance '$name': target repos: $targets"
 
     if instance_docker_enabled "$DOCKER"; then
       ANY_DOCKER=1
@@ -331,9 +397,55 @@ source "$GLOBAL_CONF"
 : "${LOG_RETENTION_DAYS:=64}"
 : "${DRY_RUN:=false}"
 
+# ---------------------------------------------------------------------------
+# Read and validate the repository list — abort if missing or empty.
+# Parsed BEFORE load_instances so the repo names are known when an instance's
+# TARGET_REPOS is validated/resolved. Still before the trap is registered, so a
+# config error here exits cleanly (without stack recovery).
+#
+# Line syntax (blank lines and "#" comments ignored):
+#   <name> = <url>   named repo; an instance's TARGET_REPOS picks it by <name>.
+#                    <name> must match ^[A-Za-z0-9_-]+$.
+#   <url>            bare URL (no "=" prefix-name); its name defaults to the URL
+#                    itself, so it can still be referenced verbatim.
+# restic URLs (rclone:/sftp:/s3:/paths) contain no "=", so the name guard never
+# misreads a URL as "name = url".
+# ---------------------------------------------------------------------------
+
+[[ -f "$REPOS_FILE" ]] || fatal "Repository list not found: $REPOS_FILE"
+while IFS= read -r line || [[ -n "$line" ]]; do
+  line="${line%%#*}"                 # remove comments
+  read -r line <<< "$line"           # trim leading/trailing whitespace (pure bash)
+  [[ -z "$line" ]] && continue
+
+  repo_name="" repo_url="$line"
+  if [[ "$line" == *=* ]]; then
+    candidate="${line%%=*}"
+    read -r candidate <<< "$candidate"             # trim the part before "="
+    if [[ "$candidate" =~ ^[A-Za-z0-9_-]+$ ]]; then
+      repo_name="$candidate"
+      repo_url="${line#*=}"
+      read -r repo_url <<< "$repo_url"             # trim the URL
+    fi
+  fi
+  [[ -z "$repo_url" ]] && continue
+  [[ -z "$repo_name" ]] && repo_name="$repo_url"   # bare URL → name is the URL
+
+  if contains "$repo_name" "${REPO_NAMES[@]+"${REPO_NAMES[@]}"}"; then
+    fatal "Duplicate repository name '$repo_name' in $REPOS_FILE — names must be unique"
+  fi
+  REPOS+=("$repo_url")
+  REPO_NAMES+=("$repo_name")
+done < "$REPOS_FILE"
+
+# Abort condition: no repositories defined
+[[ "${#REPOS[@]}" -gt 0 ]] || fatal "No repositories configured in $REPOS_FILE"
+
 # Collect all instance configurations (sets BACKUP_PATHS, EXCLUDE_PATTERNS,
-# STACK_DIRS, DUMP_DIRS and ANY_DOCKER). Done before check_binaries so the
-# docker/compose check only runs when at least one instance actually uses DOCKER.
+# STACK_DIRS, DUMP_DIRS, ANY_DOCKER and the per-instance INST_* records). Done
+# before check_binaries so the docker/compose check only runs when at least one
+# instance actually uses DOCKER, and after the repo list so TARGET_REPOS can be
+# resolved against the known repo names.
 INSTANCES_DIR="$SCRIPT_DIR/instances"
 load_instances
 
@@ -364,23 +476,6 @@ fi
 # Abort condition: the restic password file must exist
 [[ -f "$RESTIC_PASSWORD_FILE" ]] \
   || fatal "restic password file not found: $RESTIC_PASSWORD_FILE"
-
-# ---------------------------------------------------------------------------
-# Read and validate the repository list — abort if missing or empty.
-# Before registering the trap, so that we exit cleanly here (without stack recovery).
-# ---------------------------------------------------------------------------
-
-[[ -f "$REPOS_FILE" ]] || fatal "Repository list not found: $REPOS_FILE"
-REPOS=()
-while IFS= read -r line || [[ -n "$line" ]]; do
-  line="${line%%#*}"                 # remove comments
-  read -r line <<< "$line"           # trim leading/trailing whitespace (pure bash)
-  [[ -z "$line" ]] && continue
-  REPOS+=("$line")
-done < "$REPOS_FILE"
-
-# Abort condition: no repositories defined
-[[ "${#REPOS[@]}" -gt 0 ]] || fatal "No repositories configured in $REPOS_FILE"
 
 # ---------------------------------------------------------------------------
 # Telegram
@@ -646,21 +741,48 @@ fi
 have_jq=0
 command -v jq >/dev/null 2>&1 && have_jq=1
 
-# Build the restic exclude arguments from EXCLUDE_PATTERNS. All BACKUP_PATHs are
-# backed up together in one call per repo (one snapshot per repo). Relative
-# patterns have already been anchored to their instance's BACKUP_PATH by
-# load_instances, so each exclude applies only under its own path. Patterns with
-# a leading "/" were taken verbatim (user-anchored).
-EXCLUDE_ARGS=()
-for pat in "${EXCLUDE_PATTERNS[@]+"${EXCLUDE_PATTERNS[@]}"}"; do
-  EXCLUDE_ARGS+=(--exclude "$pat")
-done
-log_info "Backup paths: ${BACKUP_PATHS[*]}"
+# Each repo is backed up with exactly the paths (and their anchored excludes) of
+# the instances that target it (one snapshot per repo). The paths/excludes are
+# gathered per repo inside the loop from the INST_* records; the union lines
+# below are just an overview. Relative excludes were anchored to their instance's
+# BACKUP_PATH by load_instances; patterns with a leading "/" are verbatim.
+log_info "All backup paths: ${BACKUP_PATHS[*]}"
 if [[ "${#EXCLUDE_PATTERNS[@]}" -gt 0 ]]; then
-  log_info "Excludes: ${EXCLUDE_PATTERNS[*]}"
+  log_info "All excludes: ${EXCLUDE_PATTERNS[*]}"
 fi
 
-for repo in "${REPOS[@]}"; do
+for idx in "${!REPOS[@]}"; do
+  repo="${REPOS[$idx]}"
+  rname="${REPO_NAMES[$idx]}"
+
+  # Gather the paths and excludes of the instances targeting THIS repo.
+  repo_paths=()
+  repo_excludes=()
+  for i in "${!INST_PATH[@]}"; do
+    # INST_TARGETS[i] is a space-separated list of repo names — split without
+    # globbing via read -ra, then test membership.
+    read -ra inst_tgts <<< "${INST_TARGETS[$i]}"
+    contains "$rname" "${inst_tgts[@]+"${inst_tgts[@]}"}" || continue
+    repo_paths+=("${INST_PATH[$i]}")
+    # INST_EXCLUDES[i] is newline-separated; split and dedup into repo_excludes.
+    while IFS= read -r epat; do
+      [[ -z "$epat" ]] && continue
+      contains "$epat" "${repo_excludes[@]+"${repo_excludes[@]}"}" \
+        || repo_excludes+=("$epat")
+    done <<< "${INST_EXCLUDES[$i]}"
+  done
+
+  if [[ "${#repo_paths[@]}" -eq 0 ]]; then
+    log_info "$rname ($repo): no instance targets this repo — skipped"
+    continue
+  fi
+
+  EXCLUDE_ARGS=()
+  for pat in "${repo_excludes[@]+"${repo_excludes[@]}"}"; do
+    EXCLUDE_ARGS+=(--exclude "$pat")
+  done
+  log_info "$rname: backup paths: ${repo_paths[*]}"
+
   if ! repo_reachable "$repo"; then
     if [[ "${REPO_PROBE_STATUS:-}" == "repo-missing" ]]; then
       log_error "$repo: repository path not found on the remote — the target IS reachable, but the repo does not exist yet. Initialise it once with 'restic ... init' (see README), then re-run. Skipped."
@@ -685,7 +807,7 @@ for repo in "${REPOS[@]}"; do
     # PIPESTATUS[0] keeps restic's exit code (not tee's).
     log_info "$repo: dry-run — listing what would be backed up (output below + in log)"
     restic_repo "$repo" backup \
-        "${BACKUP_PATHS[@]}" \
+        "${repo_paths[@]}" \
         "${EXCLUDE_ARGS[@]+"${EXCLUDE_ARGS[@]}"}" \
         --tag "$HOSTNAME_SHORT" \
         --tag "$(date +%Y-%m-%d)" \
@@ -701,7 +823,7 @@ for repo in "${REPOS[@]}"; do
   fi
 
   backup_json="$(restic_repo "$repo" backup \
-      "${BACKUP_PATHS[@]}" \
+      "${repo_paths[@]}" \
       "${EXCLUDE_ARGS[@]+"${EXCLUDE_ARGS[@]}"}" \
       --tag "$HOSTNAME_SHORT" \
       --tag "$(date +%Y-%m-%d)" \

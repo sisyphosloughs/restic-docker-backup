@@ -25,6 +25,7 @@ set -euo pipefail
 DB_DUMP_LIB="${DB_DUMP_LIB:-/opt/restic-docker-backup/lib/db-dump-lib.sh}"
 
 # How many days each dump is kept (rotation). Set per stack.
+# shellcheck disable=SC2034  # read by dump_prepare in the sourced library
 RETENTION_DAYS=30
 
 # shellcheck source=/dev/null

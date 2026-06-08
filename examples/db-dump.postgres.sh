@@ -2,9 +2,10 @@
 #
 # Example db-dump.sh for PostgreSQL.
 # Copy into the respective stack directory as "db-dump.sh" and make it
-# executable (chmod +x). STACK_NAME is set by restic-backup.sh as an environment
-# variable; the dump ends up in the bind mount db-dumps/ (/tmp/dumps inside the
-# container) with a timestamped filename and is rotated by RETENTION_DAYS.
+# executable (chmod +x). The postgres container is auto-detected within this
+# stack's compose project, the dump is streamed to db-dumps/ on the host with a
+# timestamped filename and is rotated by RETENTION_DAYS. No docker-compose.yml
+# change (no bind mount) is required.
 #
 # The generic logic (db-dumps/ creation, retention, timestamps, logging) lives in
 # lib/db-dump-lib.sh next to restic-backup.sh. This script only supplies the
@@ -18,6 +19,7 @@ set -euo pipefail
 DB_DUMP_LIB="${DB_DUMP_LIB:-/opt/restic-docker-backup/lib/db-dump-lib.sh}"
 
 # How many days each dump is kept (rotation). Set per stack.
+# shellcheck disable=SC2034  # read by dump_prepare in the sourced library
 RETENTION_DAYS=30
 
 # shellcheck source=/dev/null
@@ -25,6 +27,13 @@ source "$DB_DUMP_LIB"
 
 dump_prepare
 
-# --- the actual dump (adjust the container suffix, e.g. "database-1") ---
-dump_postgres database-1
-# -----------------------------------------------------------------------
+# --- the actual dump --------------------------------------------------------
+dump_postgres            # auto-detect the postgres container in this compose
+                         # project. Several DBs in this stack? Pin one with
+                         # DB_SERVICE=<compose-service> before this line.
+
+# Optional overrides (uncomment only if auto-detection / default creds are wrong):
+# DB_SERVICE=db          # pin a specific compose service
+# DB_CONTAINER=my-pg     # use a raw container name/id (bypasses compose)
+# DB_USER=u DB_NAME=d DB_PASSWORD=s dump_postgres   # set credentials explicitly
+# ----------------------------------------------------------------------------

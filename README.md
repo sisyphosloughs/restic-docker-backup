@@ -136,7 +136,33 @@ The Docker orchestration runs as soon as **at least one** instance has
    wrappers**: the generic logic — creating `db-dumps/`, deleting old dumps
    (retention), timestamped filenames and logging — lives once in
    [lib/db-dump-lib.sh](lib/db-dump-lib.sh), which each wrapper `source`s. A
-   wrapper only supplies the DB-specific call (e.g. `dump_postgres database-1`).
+   wrapper only supplies the DB-specific call. The common case is just:
+
+   ```bash
+   source "$DB_DUMP_LIB"   # loads the shared functions (log, dump_prepare, dump_*)
+   dump_prepare            # create db-dumps/ and delete dumps older than RETENTION_DAYS
+   dump_postgres           # dump the auto-detected postgres container
+   ```
+
+   `source` pulls the shared functions into the wrapper — there is no copy-paste,
+   and the wrapper stays a few lines long.
+
+   **Container auto-detection.** `dump_postgres` / `dump_mariadb` resolve the
+   target container through `docker compose` run **from the stack directory**, so
+   a custom `container_name:` or project name no longer matters and the dump is
+   streamed straight to `db-dumps/` on the host — **no bind mount and no
+   docker-compose.yml change are needed.** SQLite has no server: that dump runs on
+   the host and writes straight into `db-dumps/`.
+
+   Per-stack overrides are plain variables set **before** the call (only needed
+   when auto-detection or the default credentials are wrong):
+
+   - `DB_SERVICE` — pin a specific compose service (e.g. several DBs in one stack).
+   - `DB_CONTAINER` — a raw container name/id, bypassing compose entirely.
+   - `DB_USER` / `DB_NAME` / `DB_PASSWORD` — set credentials explicitly. Otherwise
+     they are resolved **inside the container** from the common env vars and their
+     `_FILE` secret variants (`POSTGRES_*`, `MYSQL_ROOT_PASSWORD` /
+     `MARIADB_ROOT_PASSWORD`, …).
 
    Two settings live in each wrapper:
 
@@ -148,11 +174,8 @@ The Docker orchestration runs as soon as **at least one** instance has
      stack**. There is deliberately no global value, so each `db-dump.sh` is
      self-contained and can be tested on its own.
 
-   For the server databases (PostgreSQL, MariaDB) the dump is written to the bind
-   mount `db-dumps/` (`/tmp/dumps` inside the container) so it is backed up as
-   well. SQLite has no server: the dump runs on the host and writes straight into
-   `db-dumps/`. `STACK_NAME` (container prefix) is set by the backup script;
-   `STACK_DIR` is derived automatically.
+   `STACK_NAME` is set by the backup script; `STACK_DIR` (the compose working
+   directory) is derived automatically.
 
 ## Docker stack management (`DOCKER`)
 

@@ -13,6 +13,14 @@
 DRY_RUN=false
 # DRY_RUN=true
 
+# Progress during a real (non-dry) backup (default 30 seconds). restic's --json
+# "status" stream is throttled to one compact progress line — percent done,
+# bytes, files and ETA — per this many seconds, printed to terminal and log. This
+# makes a long (e.g. initial) run visibly do something without the per-file flood
+# of the dry run. It is a coarse overall estimate (on a large data set, files may
+# change while the backup runs). Set to 0 to disable the progress lines.
+PROGRESS_INTERVAL=30
+
 # Path to the repository list
 REPOS_FILE="$SCRIPT_DIR/repos.conf"
 

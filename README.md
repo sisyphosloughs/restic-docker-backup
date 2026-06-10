@@ -37,9 +37,9 @@ The script determines its own location at runtime; all paths are derived from
 Configuration is split in two:
 
 - **`global.conf`** — switches that apply to the whole run: `DRY_RUN`,
-  `REPOS_FILE`, `RESTIC_BIN` / `RCLONE_BIN`, `RCLONE_CONFIG_FILE`,
-  `RESTIC_PASSWORD_FILE`, the Telegram credentials, `DOCKER_STOP_TIMEOUT` and
-  `LOG_RETENTION_DAYS`.
+  `PROGRESS_INTERVAL`, `REPOS_FILE`, `RESTIC_BIN` / `RCLONE_BIN`,
+  `RCLONE_CONFIG_FILE`, `RESTIC_PASSWORD_FILE`, the Telegram credentials,
+  `DOCKER_STOP_TIMEOUT` and `LOG_RETENTION_DAYS`.
 - **`instances/<name>.conf`** — one file per object (directory) to back up. The
   script collects every `*.conf` in `instances/`. The file name (without
   `.conf`) is the instance name shown in the log. Each file may set:
@@ -367,6 +367,32 @@ DRY_RUN=true
 
 The log and the Telegram message are marked with `[DRY RUN]`. Set it back to
 `false` (the default) for normal operation.
+
+## Progress (`PROGRESS_INTERVAL`)
+
+A real (non-dry) backup is deliberately quiet — it does not list files. So that a
+long run (typically the first, initial one) visibly does *something*, restic is
+run with `--json` and the status stream is throttled to one compact progress line
+per `PROGRESS_INTERVAL` seconds (default 30), printed to terminal and log:
+
+```text
+nextcloud:  42%  1.4 GB/3.4 GB  8123/19004 files  elapsed 2m00s  ETA 2m45s
+```
+
+This is a coarse overall estimate (on a large data set, files may change while the
+backup is running — that is accepted). Set `PROGRESS_INTERVAL=0` to disable the
+lines. When the backup finishes, each repo also logs a one-line summary of what
+changed and how much *new* (deduplicated) data was written:
+
+```text
+nextcloud: backup successful (3.4 GB, snapshot a1b2c3d4)
+nextcloud: files 12 new, 3 changed, 18989 unmodified; 45.2 MB added
+```
+
+`data_added` ("… added") is the new data actually written to the repo. Thanks to
+deduplication it stays small even when many files are reported as "new" — e.g.
+after the set of backup paths changes and restic finds no parent snapshot and so
+re-reads everything.
 
 ## Workflow
 

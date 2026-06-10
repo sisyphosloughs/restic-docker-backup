@@ -396,6 +396,11 @@ source "$GLOBAL_CONF"
 : "${DOCKER_STOP_TIMEOUT:=20}"
 : "${LOG_RETENTION_DAYS:=64}"
 : "${DRY_RUN:=false}"
+# Seconds between progress lines during a real (non-dry) backup. restic's --json
+# "status" stream is throttled to one compact line (percent / bytes / files / ETA)
+# per this many seconds, so an interactive (e.g. initial) run shows progress
+# without the per-file flood of --dry-run --verbose=2. 0 disables progress lines.
+: "${PROGRESS_INTERVAL:=30}"
 
 # ---------------------------------------------------------------------------
 # Read and validate the repository list — abort if missing or empty.
@@ -518,13 +523,78 @@ human_duration() {
 human_bytes() {
   # Bytes -> "234 MB"
   local b="${1:-0}"
-  awk -v b="$b" 'BEGIN {
+  # LC_ALL=C so the ".1f" decimal uses a dot (not a comma) regardless of locale.
+  LC_ALL=C awk -v b="$b" 'BEGIN {
     split("B KB MB GB TB PB", u, " ");
     i = 1;
     while (b >= 1024 && i < 6) { b /= 1024; i++ }
     if (i == 1) printf "%d %s", b, u[i];
     else printf "%.1f %s", b, u[i];
   }'
+}
+
+json_num() {
+  # json_num <json-line> <field> — extract a numeric field from a single-line
+  # restic JSON object. Uses jq when available (have_jq, set in the backup
+  # section), otherwise the same grep fallback as the summary parsing. Always
+  # prints a number (0 if the field is absent), so callers can use it directly.
+  local json="$1" field="$2" v
+  if [[ "${have_jq:-0}" -eq 1 ]]; then
+    v="$(printf '%s' "$json" | jq -r --arg f "$field" '.[$f] // 0' 2>/dev/null)"
+  else
+    v="$(printf '%s' "$json" | grep -o "\"$field\":[0-9]*" | grep -o '[0-9]*' | head -n1)"
+  fi
+  printf '%s' "${v:-0}"
+}
+
+progress_filter() {
+  # progress_filter <repo-name> <summary-file>
+  # Reads restic's "backup --json" stream on stdin. Emits ONE compact human
+  # progress line on stdout per PROGRESS_INTERVAL seconds of restic's own elapsed
+  # time (so no wall-clock call is needed inside awk — works under gawk/mawk/
+  # busybox awk); the caller tees that to terminal + log. The JSON "summary"
+  # message is written to <summary-file> for the caller to parse and is NOT
+  # printed; every other message type (incl. per-file "verbose_status") is
+  # dropped, so the log never gets the --verbose=2 per-file flood.
+  local rname="$1" sfile="$2"
+  # LC_ALL=C so awk parses restic's dot-decimal JSON (e.g. "percent_done":0.42)
+  # and formats numbers with a dot, regardless of the host's locale — a
+  # comma-decimal locale would otherwise read 0.42 as 0 and print "417,8 MB".
+  LC_ALL=C awk -v RNAME="$rname" -v SFILE="$sfile" -v INTERVAL="${PROGRESS_INTERVAL:-30}" '
+    function num(f,   s) {
+      if (match($0, "\"" f "\":[0-9.]+")) {
+        s = substr($0, RSTART, RLENGTH); sub("\"" f "\":", "", s); return s + 0
+      }
+      return -1
+    }
+    function hb(b,   u, i) {
+      split("B KB MB GB TB PB", u, " "); i = 1
+      while (b >= 1024 && i < 6) { b /= 1024; i++ }
+      if (i == 1) return sprintf("%d %s", b, u[i])
+      return sprintf("%.1f %s", b, u[i])
+    }
+    function dur(s) { if (s < 0) return "?"; return sprintf("%dm%02ds", int(s / 60), s % 60) }
+    BEGIN { last = -1 }
+    /"message_type":"summary"/ { print $0 > SFILE; close(SFILE); next }
+    /"message_type":"status"/ {
+      if (INTERVAL <= 0) next
+      el = num("seconds_elapsed"); if (el < 0) el = 0
+      bucket = int(el / INTERVAL)
+      if (bucket <= last) next
+      last = bucket
+      pct = num("percent_done"); bd = num("bytes_done"); tb = num("total_bytes")
+      fd = num("files_done"); tf = num("total_files"); rem = num("seconds_remaining")
+      if (tb > 0) {
+        printf "%s: %3d%%  %s/%s  %d/%d files  elapsed %s  ETA %s\n", \
+          RNAME, int(pct * 100 + 0.5), hb(bd), hb(tb), fd, tf, dur(el), dur(rem)
+      } else {
+        printf "%s: scanning...  %d files  elapsed %s\n", RNAME, (fd < 0 ? 0 : fd), dur(el)
+      }
+      fflush()
+      next
+    }
+    { next }
+  '
 }
 
 # restic wrapper with password file
@@ -822,16 +892,26 @@ for idx in "${!REPOS[@]}"; do
     continue
   fi
 
-  backup_json="$(restic_repo "$repo" backup \
+  # Real run. Stream restic's --json output through progress_filter so an
+  # interactive (e.g. initial) run shows that something is happening and how far
+  # along it is — one throttled progress line per PROGRESS_INTERVAL seconds — on
+  # terminal AND in the log (via tee), without the per-file flood of --verbose=2.
+  # The filter stashes the JSON summary line in a temp file for the parsing below;
+  # restic's exit code is taken from PIPESTATUS[0] (the trailing awk/tee must not
+  # mask it — read it on the very next line, as the dry-run branch does).
+  summary_tmp="$(mktemp 2>/dev/null)" || summary_tmp="$LOG_DIR/.summary-$$-$idx"
+  : > "$summary_tmp"
+  restic_repo "$repo" backup \
       "${repo_paths[@]}" \
       "${EXCLUDE_ARGS[@]+"${EXCLUDE_ARGS[@]}"}" \
       --tag "$HOSTNAME_SHORT" \
       --tag "$(date +%Y-%m-%d)" \
-      --json 2>>"$LOG_FILE")"
-  rc=$?
-
-  # Extract the summary line from the JSON stream
-  summary_line="$(printf '%s\n' "$backup_json" | grep '"message_type":"summary"' | tail -n 1)"
+      --json 2>>"$LOG_FILE" \
+    | progress_filter "$rname" "$summary_tmp" \
+    | tee -a "$LOG_FILE"
+  rc="${PIPESTATUS[0]}"
+  summary_line="$(cat "$summary_tmp" 2>/dev/null)"
+  rm -f "$summary_tmp"
 
   bytes=0
   snapshot="?"
@@ -853,6 +933,11 @@ for idx in "${!REPOS[@]}"; do
     log_error "$repo: 0 bytes backed up"
   else
     log_info "$repo: backup successful ($(human_bytes "$bytes"), snapshot $snapshot)"
+    # Counts from the summary (overview of what actually changed this run) plus
+    # data_added — the deduplicated new data really written to the repo, so it
+    # stays small even when many files show up as "new" (e.g. after a path-set
+    # change makes restic find no parent snapshot and re-read everything).
+    log_info "$repo: files $(json_num "$summary_line" files_new) new, $(json_num "$summary_line" files_changed) changed, $(json_num "$summary_line" files_unmodified) unmodified; $(human_bytes "$(json_num "$summary_line" data_added)") added"
     SUCCESS_TARGETS+=("$repo")
   fi
 done
